@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la \"/Users/diegotueromadiedo/Desktop/BASE DATOS /\" 2>&1)",
+      "Bash(python3 -c \"import numbers_parser\")",
+      "Bash(pip3 show *)",
+      "Bash(pip3 install *)",
+      "Bash(python3 -c ' *)",
+      "Bash(jobs -l)",
+      "Bash(kill 5067)"
+    ]
+  }
+}

@@ -1,0 +1,672 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Base de Datos de Jugadores</title>
+<style>
+  :root {
+    --bg: #0b0f17;
+    --bg-elevated: #121826;
+    --bg-card: #161d2c;
+    --bg-hover: #1c2438;
+    --border: #232c40;
+    --text: #e8ecf4;
+    --text-dim: #8c96ab;
+    --text-faint: #5c667c;
+    --accent: #4f8cff;
+    --accent-dim: #2a3b5c;
+    --green: #35c987;
+    --yellow: #e8b84b;
+    --red: #ef6461;
+    --blue: #4f8cff;
+    --gray: #6b7690;
+    --radius: 12px;
+    --shadow: 0 4px 20px rgba(0,0,0,0.35);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  header {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    background: rgba(11,15,23,0.85);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--border);
+    padding: 16px 24px;
+  }
+
+  .header-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 14px;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+
+  .title-block h1 {
+    font-size: 19px;
+    font-weight: 700;
+    margin: 0;
+    letter-spacing: -0.2px;
+  }
+
+  .title-block .subtitle {
+    font-size: 12.5px;
+    color: var(--text-dim);
+    margin-top: 2px;
+  }
+
+  .status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12.5px;
+    color: var(--text-dim);
+    background: var(--bg-elevated);
+    padding: 6px 12px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+  }
+
+  .status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 0 3px rgba(53,201,135,0.18);
+    flex-shrink: 0;
+    transition: background 0.3s, box-shadow 0.3s;
+  }
+
+  .status-dot.syncing {
+    background: var(--yellow);
+    box-shadow: 0 0 0 3px rgba(232,184,75,0.18);
+    animation: pulse 1s ease-in-out infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+
+  .filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+  }
+
+  .filters input[type="text"],
+  .filters select {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 8px;
+    padding: 8px 12px;
+    font-size: 13.5px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+
+  .filters input[type="text"]:focus,
+  .filters select:focus {
+    border-color: var(--accent);
+  }
+
+  .filters input[type="text"] {
+    width: 200px;
+  }
+
+  .filters select {
+    max-width: 180px;
+  }
+
+  .age-filter {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 6px 12px;
+    font-size: 13px;
+    color: var(--text-dim);
+  }
+
+  .age-filter input {
+    width: 42px;
+    background: transparent;
+    border: none;
+    color: var(--text);
+    font-size: 13.5px;
+    outline: none;
+    text-align: center;
+  }
+
+  .reset-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    border-radius: 8px;
+    padding: 8px 14px;
+    font-size: 13px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .reset-btn:hover {
+    border-color: var(--red);
+    color: var(--red);
+  }
+
+  .result-count {
+    font-size: 12.5px;
+    color: var(--text-faint);
+    margin-left: auto;
+    white-space: nowrap;
+  }
+
+  main {
+    padding: 24px;
+    max-width: 1400px;
+    margin: 0 auto;
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+    gap: 14px;
+  }
+
+  .card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px;
+    cursor: pointer;
+    transition: transform 0.15s, border-color 0.15s, box-shadow 0.15s;
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+  }
+
+  .card:hover {
+    transform: translateY(-2px);
+    border-color: var(--accent-dim);
+    box-shadow: var(--shadow);
+    background: var(--bg-hover);
+  }
+
+  .avatar {
+    width: 52px;
+    height: 52px;
+    border-radius: 10px;
+    background: var(--bg-elevated);
+    object-fit: cover;
+    flex-shrink: 0;
+    border: 1px solid var(--border);
+  }
+
+  .avatar-placeholder {
+    width: 52px;
+    height: 52px;
+    border-radius: 10px;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 15px;
+    font-weight: 700;
+    color: var(--text-faint);
+    flex-shrink: 0;
+  }
+
+  .card-body {
+    min-width: 0;
+    flex: 1;
+  }
+
+  .card-name {
+    font-size: 14.5px;
+    font-weight: 650;
+    margin-bottom: 3px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .card-team {
+    font-size: 12px;
+    color: var(--text-dim);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-bottom: 8px;
+  }
+
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    font-size: 10.5px;
+    font-weight: 650;
+    padding: 3px 8px;
+    border-radius: 999px;
+    letter-spacing: 0.2px;
+  }
+
+  .badge-Portero { background: rgba(232,184,75,0.15); color: var(--yellow); }
+  .badge-Defensa { background: rgba(79,140,255,0.15); color: var(--blue); }
+  .badge-Centrocampista { background: rgba(53,201,135,0.15); color: var(--green); }
+  .badge-Delantero { background: rgba(239,100,97,0.15); color: var(--red); }
+  .badge-Otro, .badge-Sin-clasificar { background: rgba(107,118,144,0.15); color: var(--gray); }
+
+  .card-meta {
+    display: flex;
+    gap: 6px;
+    margin-top: 8px;
+    font-size: 11px;
+    color: var(--text-faint);
+    flex-wrap: wrap;
+  }
+
+  .no-ficha {
+    font-size: 10px;
+    color: var(--text-faint);
+    margin-top: 6px;
+    font-style: italic;
+  }
+
+  .empty-state {
+    text-align: center;
+    padding: 80px 20px;
+    color: var(--text-faint);
+  }
+
+  /* Modal */
+  .overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(5,7,12,0.7);
+    backdrop-filter: blur(4px);
+    display: none;
+    align-items: flex-start;
+    justify-content: center;
+    z-index: 100;
+    padding: 40px 20px;
+    overflow-y: auto;
+  }
+
+  .overlay.open { display: flex; }
+
+  .modal {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    max-width: 640px;
+    width: 100%;
+    padding: 28px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+  }
+
+  .modal-header {
+    display: flex;
+    gap: 16px;
+    align-items: flex-start;
+    margin-bottom: 20px;
+  }
+
+  .modal-avatar {
+    width: 84px;
+    height: 84px;
+    border-radius: 12px;
+    object-fit: cover;
+    border: 1px solid var(--border);
+    background: var(--bg-elevated);
+    flex-shrink: 0;
+  }
+
+  .modal-title-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    flex: 1;
+    gap: 10px;
+  }
+
+  .modal h2 {
+    font-size: 21px;
+    margin: 0 0 6px 0;
+  }
+
+  .modal .modal-sub {
+    font-size: 13px;
+    color: var(--text-dim);
+  }
+
+  .close-btn {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    width: 30px;
+    height: 30px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 16px;
+    line-height: 1;
+    flex-shrink: 0;
+  }
+
+  .close-btn:hover { color: var(--text); border-color: var(--accent); }
+
+  .stat-row {
+    display: flex;
+    gap: 20px;
+    flex-wrap: wrap;
+    margin: 16px 0 22px 0;
+    padding: 12px 0;
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .stat {
+    font-size: 12.5px;
+  }
+
+  .stat .stat-label {
+    color: var(--text-faint);
+    display: block;
+    margin-bottom: 2px;
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+  }
+
+  .section {
+    margin-bottom: 18px;
+  }
+
+  .section h3 {
+    font-size: 11.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-faint);
+    margin: 0 0 8px 0;
+  }
+
+  .section p {
+    font-size: 13.5px;
+    line-height: 1.6;
+    color: var(--text);
+    margin: 0;
+  }
+
+  .section ul {
+    margin: 0;
+    padding-left: 18px;
+  }
+
+  .section li {
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--text-dim);
+    margin-bottom: 4px;
+  }
+
+  @media (max-width: 640px) {
+    header { padding: 12px 16px; }
+    main { padding: 16px; }
+    .filters input[type="text"] { width: 140px; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="header-top">
+    <div class="title-block">
+      <h1>Base de Datos de Jugadores</h1>
+      <div class="subtitle" id="subtitle">Cargando...</div>
+    </div>
+    <div class="status">
+      <span class="status-dot" id="statusDot"></span>
+      <span id="statusText">Sincronizado</span>
+    </div>
+  </div>
+  <div class="filters">
+    <input type="text" id="fSearch" placeholder="Buscar jugador...">
+    <select id="fPosGeneral"><option value="">Posición (general)</option></select>
+    <select id="fPosicion"><option value="">Posición (detalle)</option></select>
+    <select id="fCompeticion"><option value="">Competición</option></select>
+    <select id="fEquipo"><option value="">Equipo</option></select>
+    <select id="fPie"><option value="">Pie dominante</option></select>
+    <div class="age-filter">
+      Edad <input type="number" id="fEdadMin" placeholder="min"> – <input type="number" id="fEdadMax" placeholder="max">
+    </div>
+    <button class="reset-btn" id="resetBtn">Limpiar filtros</button>
+    <span class="result-count" id="resultCount"></span>
+  </div>
+</header>
+
+<main>
+  <div class="grid" id="grid"></div>
+  <div class="empty-state" id="emptyState" style="display:none;">No se encontraron jugadores con estos filtros.</div>
+</main>
+
+<div class="overlay" id="overlay">
+  <div class="modal" id="modal"></div>
+</div>
+
+<script>
+let DATA = { players: [], filters: {}, generated_at: 0 };
+let filtered = [];
+
+const el = id => document.getElementById(id);
+
+function badgeClass(posGeneral) {
+  return 'badge-' + (posGeneral || 'Otro').replace(/\s+/g, '-');
+}
+
+function initials(name) {
+  return name.split(/\s+/).filter(Boolean).slice(0, 2).map(w => w[0]).join('').toUpperCase();
+}
+
+function populateSelect(select, values, current) {
+  const prevValue = current !== undefined ? current : select.value;
+  const placeholder = select.options[0];
+  select.innerHTML = '';
+  select.appendChild(placeholder);
+  values.forEach(v => {
+    const opt = document.createElement('option');
+    opt.value = v;
+    opt.textContent = v;
+    select.appendChild(opt);
+  });
+  if (values.includes(prevValue)) select.value = prevValue;
+}
+
+function renderFilterOptions() {
+  const f = DATA.filters;
+  populateSelect(el('fPosGeneral'), f.posiciones_generales || []);
+  populateSelect(el('fPosicion'), f.posiciones || []);
+  populateSelect(el('fCompeticion'), f.competiciones || []);
+  populateSelect(el('fEquipo'), f.equipos || []);
+  populateSelect(el('fPie'), f.pies || []);
+  if (!el('fEdadMin').value) el('fEdadMin').placeholder = String(f.edad_min ?? '');
+  if (!el('fEdadMax').value) el('fEdadMax').placeholder = String(f.edad_max ?? '');
+}
+
+function applyFilters() {
+  const search = el('fSearch').value.trim().toLowerCase();
+  const posGeneral = el('fPosGeneral').value;
+  const posicion = el('fPosicion').value;
+  const competicion = el('fCompeticion').value;
+  const equipo = el('fEquipo').value;
+  const pie = el('fPie').value;
+  const edadMin = el('fEdadMin').value ? parseInt(el('fEdadMin').value) : null;
+  const edadMax = el('fEdadMax').value ? parseInt(el('fEdadMax').value) : null;
+
+  filtered = DATA.players.filter(p => {
+    if (search && !p.nombre.toLowerCase().includes(search)) return false;
+    if (posGeneral && p.posicion_general !== posGeneral) return false;
+    if (posicion && p.posicion !== posicion) return false;
+    if (competicion && p.competicion !== competicion) return false;
+    if (equipo && p.equipo !== equipo) return false;
+    if (pie && p.pie_dominante !== pie) return false;
+    if (edadMin !== null && (typeof p.edad !== 'number' || p.edad < edadMin)) return false;
+    if (edadMax !== null && (typeof p.edad !== 'number' || p.edad > edadMax)) return false;
+    return true;
+  });
+
+  renderGrid();
+}
+
+function renderGrid() {
+  const grid = el('grid');
+  const empty = el('emptyState');
+  el('resultCount').textContent = `${filtered.length} de ${DATA.players.length} jugadores`;
+
+  if (filtered.length === 0) {
+    grid.innerHTML = '';
+    empty.style.display = 'block';
+    return;
+  }
+  empty.style.display = 'none';
+
+  grid.innerHTML = filtered.map(p => `
+    <div class="card" data-id="${p.id}">
+      ${p.imagen
+        ? `<img class="avatar" src="${p.imagen}" alt="" loading="lazy" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'avatar-placeholder',textContent:'${initials(p.nombre)}'}))">`
+        : `<div class="avatar-placeholder">${initials(p.nombre)}</div>`}
+      <div class="card-body">
+        <div class="card-name">${p.nombre}</div>
+        <div class="card-team">${[p.equipo, p.competicion].filter(Boolean).join(' · ') || '—'}</div>
+        <span class="badge ${badgeClass(p.posicion_general)}">${p.posicion || p.posicion_general}</span>
+        <div class="card-meta">
+          ${typeof p.edad === 'number' ? `<span>${p.edad} años</span>` : ''}
+          ${p.pie_dominante ? `<span>· ${p.pie_dominante}</span>` : ''}
+        </div>
+        ${!p.ficha_completa ? '<div class="no-ficha">Sin ficha detallada</div>' : ''}
+      </div>
+    </div>
+  `).join('');
+
+  grid.querySelectorAll('.card').forEach(card => {
+    card.addEventListener('click', () => openModal(card.dataset.id));
+  });
+}
+
+function openModal(id) {
+  const p = DATA.players.find(x => x.id === id);
+  if (!p) return;
+
+  const modal = el('modal');
+  modal.innerHTML = `
+    <div class="modal-header">
+      ${p.imagen
+        ? `<img class="modal-avatar" src="${p.imagen}" alt="">`
+        : `<div class="avatar-placeholder" style="width:84px;height:84px;font-size:24px;">${initials(p.nombre)}</div>`}
+      <div class="modal-title-row">
+        <div>
+          <h2>${p.nombre}</h2>
+          <div class="modal-sub">${[p.equipo, p.competicion].filter(Boolean).join(' · ') || 'Sin equipo/competición registrados'}</div>
+          <span class="badge ${badgeClass(p.posicion_general)}" style="margin-top:8px;">${p.posicion || p.posicion_general}</span>
+        </div>
+        <button class="close-btn" id="closeBtn">✕</button>
+      </div>
+    </div>
+    <div class="stat-row">
+      <div class="stat"><span class="stat-label">Edad</span>${typeof p.edad === 'number' ? p.edad : '—'}</div>
+      <div class="stat"><span class="stat-label">Pie dominante</span>${p.pie_dominante || '—'}</div>
+      <div class="stat"><span class="stat-label">Dorsal</span>${p.dorsal || '—'}</div>
+      <div class="stat"><span class="stat-label">Altura</span>${p.altura ? p.altura + ' m' : '—'}</div>
+      <div class="stat"><span class="stat-label">Peso</span>${(p.peso && String(p.peso).trim()) ? p.peso + ' kg' : '—'}</div>
+    </div>
+    ${p.perfil ? `<div class="section"><h3>Perfil del jugador</h3><p>${p.perfil}</p></div>` : ''}
+    ${p.aspectos_ofensivos.length ? `<div class="section"><h3>Aspectos ofensivos</h3><ul>${p.aspectos_ofensivos.map(x => `<li>${x}</li>`).join('')}</ul></div>` : ''}
+    ${p.aspectos_defensivos.length ? `<div class="section"><h3>Aspectos defensivos</h3><ul>${p.aspectos_defensivos.map(x => `<li>${x}</li>`).join('')}</ul></div>` : ''}
+    ${p.notas_partidos.length ? `<div class="section"><h3>Notas de partidos observados</h3><ul>${p.notas_partidos.map(x => `<li>${x}</li>`).join('')}</ul></div>` : ''}
+    ${!p.ficha_completa ? '<div class="section"><p style="color:var(--text-faint);font-style:italic;">Este jugador solo tiene datos de la tabla maestra; no tiene ficha detallada en el archivo.</p></div>' : ''}
+  `;
+  modal.querySelector('#closeBtn').addEventListener('click', closeModal);
+  el('overlay').classList.add('open');
+}
+
+function closeModal() {
+  el('overlay').classList.remove('open');
+}
+
+el('overlay').addEventListener('click', e => {
+  if (e.target === el('overlay')) closeModal();
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeModal();
+});
+
+['fSearch','fPosGeneral','fPosicion','fCompeticion','fEquipo','fPie','fEdadMin','fEdadMax'].forEach(id => {
+  el(id).addEventListener('input', applyFilters);
+  el(id).addEventListener('change', applyFilters);
+});
+
+el('resetBtn').addEventListener('click', () => {
+  ['fSearch','fPosGeneral','fPosicion','fCompeticion','fEquipo','fPie','fEdadMin','fEdadMax'].forEach(id => {
+    el(id).value = '';
+  });
+  applyFilters();
+});
+
+function formatAgo(ts) {
+  const secs = Math.floor(Date.now()/1000 - ts);
+  if (secs < 5) return 'justo ahora';
+  if (secs < 60) return `hace ${secs}s`;
+  const mins = Math.floor(secs/60);
+  if (mins < 60) return `hace ${mins} min`;
+  const hrs = Math.floor(mins/60);
+  return `hace ${hrs} h`;
+}
+
+function updateSubtitle() {
+  el('subtitle').textContent = `${DATA.count} jugadores · datos generados ${formatAgo(DATA.generated_at)}`;
+}
+
+async function loadData(isPoll) {
+  try {
+    if (isPoll) {
+      el('statusDot').classList.add('syncing');
+    }
+    const res = await fetch('data.json?_=' + Date.now(), { cache: 'no-store' });
+    const newData = await res.json();
+    const changed = newData.generated_at !== DATA.generated_at;
+    DATA = newData;
+    if (changed || !isPoll) {
+      renderFilterOptions();
+      applyFilters();
+    }
+    el('statusText').textContent = 'Sincronizado';
+    el('statusDot').classList.remove('syncing');
+    updateSubtitle();
+  } catch (e) {
+    el('statusText').textContent = 'Error de conexión';
+    el('statusDot').classList.remove('syncing');
+    console.error(e);
+  }
+}
+
+loadData(false);
+setInterval(() => loadData(true), 8000);
+setInterval(updateSubtitle, 15000);
+</script>
+
+</body>
+</html>
