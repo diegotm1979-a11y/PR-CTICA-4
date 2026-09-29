@@ -6,6 +6,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.26.10/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.2/html2pdf.bundle.min.js"></script>
 <script src="https://cdn.tailwindcss.com"></script>
 <script>
   tailwind.config = {
@@ -367,12 +368,24 @@ function aplicarFormacion(titulares, sistema) {
       if (p) { used.add(p.id); fichas[slotIdx] = { playerId: p.id, x: tpl[slotIdx].x, y: tpl[slotIdx].y }; }
     });
   });
+  // Si la convocatoria no encaja con el reparto de líneas del sistema elegido (p.ej. dos
+  // porteros entre los titulares, o más centrales que huecos de defensa), sobran jugadores
+  // de unas líneas y faltan de otras. Para no acabar colocando a un portero en el centro del
+  // campo, cada hueco libre se rellena con el sobrante cuya línea real quede más cerca de la
+  // línea de ese hueco (DEF antes que MED en un hueco de MED, por ejemplo).
+  const LINE_ORDER = ['POR', 'DEF', 'MED', 'DEL'];
   const leftovers = pool.filter(p => !used.has(p.id));
   fichas.forEach((f, i) => {
-    if (!f) {
-      const p = leftovers.shift();
-      fichas[i] = p ? { playerId: p.id, x: tpl[i].x, y: tpl[i].y } : { playerId: null, x: tpl[i].x, y: tpl[i].y };
-    }
+    if (f) return;
+    if (!leftovers.length) { fichas[i] = { playerId: null, x: tpl[i].x, y: tpl[i].y }; return; }
+    const slotOrder = LINE_ORDER.indexOf(tpl[i].line);
+    let bestIdx = 0, bestDist = Infinity;
+    leftovers.forEach((p, li) => {
+      const dist = Math.abs(LINE_ORDER.indexOf(posicionALinea(p.posicion)) - slotOrder);
+      if (dist < bestDist) { bestDist = dist; bestIdx = li; }
+    });
+    const p = leftovers.splice(bestIdx, 1)[0];
+    fichas[i] = { playerId: p.id, x: tpl[i].x, y: tpl[i].y };
   });
   return fichas.filter(Boolean);
 }
@@ -398,9 +411,62 @@ function initCapabilities() {
 
 const LOCAL_STORAGE_PREFIX = 'sportingBanquillo:store:';
 
+// Las fotos y vídeos ("photo:"/"video:") pueden pesar mucho más que la cuota
+// de localStorage (unos pocos MB). Se guardan en IndexedDB, que admite
+// archivos grandes, en vez de localStorage (que sólo vale para JSON pequeño).
+const BINARY_ASSET_DB = 'sportingBanquilloAssets';
+const BINARY_ASSET_STORE = 'assets';
+
+function isBinaryAssetKey(key) {
+  return key.startsWith('photo:') || key.startsWith('video:');
+}
+
+let __assetDbPromise = null;
+function openAssetDb() {
+  if (!__assetDbPromise) {
+    __assetDbPromise = new Promise((resolve, reject) => {
+      const req = indexedDB.open(BINARY_ASSET_DB, 1);
+      req.onupgradeneeded = () => { req.result.createObjectStore(BINARY_ASSET_STORE); };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+  return __assetDbPromise;
+}
+async function idbGet(key) {
+  const db = await openAssetDb();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(BINARY_ASSET_STORE, 'readonly').objectStore(BINARY_ASSET_STORE).get(key);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function idbSet(key, value) {
+  const db = await openAssetDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(BINARY_ASSET_STORE, 'readwrite');
+    tx.objectStore(BINARY_ASSET_STORE).put(value, key);
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = () => reject(tx.error);
+  });
+}
+async function idbDelete(key) {
+  const db = await openAssetDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(BINARY_ASSET_STORE, 'readwrite');
+    tx.objectStore(BINARY_ASSET_STORE).delete(key);
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
 async function storageGet(key) {
   await initCapabilities();
   if (!__dbApi) {
+    if (isBinaryAssetKey(key)) {
+      const fromIdb = await idbGet(key).catch(() => undefined);
+      if (fromIdb !== undefined) return fromIdb;
+    }
     const raw = localStorage.getItem(LOCAL_STORAGE_PREFIX + key);
     if (raw === null) throw new Error('not_found:' + key);
     return JSON.parse(raw);
@@ -414,6 +480,10 @@ async function storageGet(key) {
 async function storageSet(key, value) {
   await initCapabilities();
   if (!__dbApi) {
+    if (isBinaryAssetKey(key)) {
+      await idbSet(key, value);
+      return true;
+    }
     localStorage.setItem(LOCAL_STORAGE_PREFIX + key, JSON.stringify(value));
     return true;
   }
@@ -424,6 +494,9 @@ async function storageSet(key, value) {
 async function storageDelete(key) {
   await initCapabilities();
   if (!__dbApi) {
+    if (isBinaryAssetKey(key)) {
+      await idbDelete(key).catch(() => {});
+    }
     localStorage.removeItem(LOCAL_STORAGE_PREFIX + key);
     return true;
   }
@@ -486,8 +559,85 @@ async function repairMojibake(key, value) {
 
 async function offerDownload(filename, data) {
   await initCapabilities();
-  if (!__downloadsApi) throw new Error('sin_descargas');
-  return __downloadsApi.save({ filename, data });
+  if (__downloadsApi) return __downloadsApi.save({ filename, data });
+  const blob = new Blob([data], { type: 'text/plain' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// Captura el nodo tal y como se está mostrando en la app (respeta colores, tema y contenido
+// real) en vez de reconstruir un documento aparte: así el PDF coincide con lo que se ve en pantalla.
+// html2canvas no captura correctamente un nodo desplazado fuera de la ventana visible (produce
+// páginas en blanco), así que el nodo debe seguir formando parte del layout visible al capturarlo.
+// windowWidth/windowHeight se fijan al tamaño real de la ventana para que las clases responsive
+// (sm:, lg:) se resuelvan igual que en pantalla dentro del clon que usa html2canvas.
+async function exportNodeToPdf(filename, node) {
+  if (!window.html2pdf) throw new Error('sin_pdf');
+  if (!node) throw new Error('sin_contenido');
+  await window.html2pdf().set({
+    margin: 8,
+    filename,
+    html2canvas: {
+      scale: 2, useCORS: true, backgroundColor: '#ffffff',
+      windowWidth: document.documentElement.clientWidth,
+      windowHeight: document.documentElement.clientHeight,
+    },
+    jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' },
+    pagebreak: { mode: ['css', 'legacy'] },
+  }).from(node).save();
+}
+
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(new Error('lectura_fallida'));
+    reader.readAsDataURL(blob);
+  });
+}
+
+function loadImageElement(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('imagen_invalida'));
+    img.src = src;
+  });
+}
+
+// Documento PDF en blanco (A4) sobre el que dibujar manualmente con la API de jsPDF.
+async function createPdfDocument() {
+  if (!window.html2pdf) throw new Error('sin_pdf');
+  const dummy = document.createElement('div');
+  dummy.style.cssText = 'width:1px;height:1px';
+  document.body.appendChild(dummy);
+  try {
+    return await window.html2pdf().set({ jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' }, margin: 0 }).from(dummy).toPdf().get('pdf');
+  } finally {
+    dummy.remove();
+  }
+}
+
+// Renderiza un nodo a canvas fijando su ancho/alto reales: sin esto, html2canvas recalcula el
+// layout con otro ancho de ventana y rompe utilidades responsive (p.ej. el panel del banquillo,
+// que solo tiene un ancho fijo a partir de cierto breakpoint, se capturaba a ancho completo).
+async function nodeToCanvas(node) {
+  if (!window.html2pdf) throw new Error('sin_pdf');
+  const rect = node.getBoundingClientRect();
+  return window.html2pdf().set({
+    html2canvas: {
+      scale: 2, useCORS: true, backgroundColor: '#ffffff',
+      width: rect.width, height: rect.height,
+      windowWidth: document.documentElement.clientWidth,
+      windowHeight: document.documentElement.clientHeight,
+    },
+  }).from(node).toCanvas().get('canvas');
 }
 
 async function sha256(text) {
@@ -522,6 +672,15 @@ function resizeImageFile(file, maxDim, quality) {
   });
 }
 
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('lectura_fallida'));
+    reader.onload = () => resolve(reader.result);
+    reader.readAsDataURL(file);
+  });
+}
+
 function parseVideoUrl(url) {
   try {
     const u = new URL(url);
@@ -551,6 +710,98 @@ function buildTimestampUrl(url, segundos) {
   if (info.tipo === 'youtube') return 'https://www.youtube.com/watch?v=' + info.id + '&t=' + s + 's';
   if (info.tipo === 'vimeo') return url.split('#')[0] + '#t=' + s + 's';
   return url;
+}
+
+function extractYoutubeId(url) {
+  const info = parseVideoUrl(url);
+  return info.tipo === 'youtube' ? info.id : null;
+}
+
+// Carga (una sola vez) la API de IFrame de YouTube para poder controlar el reproductor
+// (play/pause/seek/tiempo actual) desde el videoanálisis.
+function loadYouTubeApi() {
+  if (window.YT && window.YT.Player) return Promise.resolve(window.YT);
+  if (!window.__ytApiPromise) {
+    window.__ytApiPromise = new Promise((resolve) => {
+      const prevCb = window.onYouTubeIframeAPIReady;
+      window.onYouTubeIframeAPIReady = function () {
+        if (prevCb) prevCb();
+        resolve(window.YT);
+      };
+      const tag = document.createElement('script');
+      tag.src = 'https://www.youtube.com/iframe_api';
+      document.head.appendChild(tag);
+    });
+  }
+  return window.__ytApiPromise;
+}
+
+// Cada evento registra un corte de vídeo: arranca 5" antes del instante del click y llega
+// hasta 15" después (20" en total), y luego se puede alargar o acortar a mano.
+const CLIP_SEGUNDOS_ANTES = 5;
+const CLIP_SEGUNDOS_DESPUES = 15;
+
+// GOL/OCASIÓN+signo, ABP OF/DEF e INDIVIDUAL son cada uno suficiente por sí solo para
+// registrar un evento (no hace falta combinarlos con gol/ocasión), así que tipo_jugada y
+// signo pueden quedar sin rellenar.
+function labelTipoJugada(tipo) {
+  if (tipo === 'gol') return 'Gol';
+  if (tipo === 'ocasion') return 'Ocasión';
+  return '—';
+}
+function labelSigno(signo) {
+  if (signo === 'favor') return 'A favor';
+  if (signo === 'contra') return 'En contra';
+  return '—';
+}
+
+// Traduce un evento de videoanálisis a la categoría de clip que se usa en la pestaña
+// Jornadas, para que el corte se pueda mostrar allí igual que un clip manual.
+function categoriaClipDeEvento(evento) {
+  if (evento.abp) return 'abp';
+  if (evento.tipo_jugada === 'gol') return 'gol';
+  return 'otro';
+}
+function descripcionEvento(evento, players) {
+  const jugador = players.find(p => p.id === evento.jugador_id);
+  return [
+    evento.tipo_jugada ? labelTipoJugada(evento.tipo_jugada) : null,
+    evento.signo ? labelSigno(evento.signo) : null,
+    evento.abp ? (evento.abp === 'ofensiva' ? 'ABP ofensiva' : 'ABP defensiva') : null,
+    evento.individual ? 'Individual' : null,
+    jugador ? jugador.nombre : null,
+  ].filter(Boolean).join(' · ') || 'Evento';
+}
+function clipDeEvento(evento, players) {
+  return { id: evento.id, inicio: evento.inicio, fin: evento.fin, categoria: categoriaClipDeEvento(evento), nota: descripcionEvento(evento, players) };
+}
+
+function eventoVideoanalisisToRow(evento, index, players) {
+  const jugador = players.find(p => p.id === evento.jugador_id);
+  return [
+    index + 1,
+    evento.parte,
+    mmss(evento.inicio),
+    mmss(evento.fin),
+    Math.round((evento.fin - evento.inicio) * 10) / 10,
+    labelTipoJugada(evento.tipo_jugada),
+    labelSigno(evento.signo),
+    evento.abp ? (evento.abp === 'ofensiva' ? 'ABP ofensiva' : 'ABP defensiva') : '',
+    evento.individual ? 'Sí' : 'No',
+    jugador ? jugador.nombre : '',
+    evento.posicion_campo ? Math.round(evento.posicion_campo.x) : '',
+    evento.posicion_campo ? Math.round(evento.posicion_campo.y) : '',
+  ];
+}
+
+function eventosVideoanalisisToCsv(eventos, players) {
+  const headers = ['Nº', 'Parte', 'Inicio', 'Fin', 'Duración (s)', 'Tipo', 'Signo', 'ABP', 'Individual', 'Jugador', 'Campo X (%)', 'Campo Y (%)'];
+  const escapeCsv = (v) => {
+    const s = String(v == null ? '' : v);
+    return /[",;\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  const rows = [headers, ...eventos.map((e, i) => eventoVideoanalisisToRow(e, i, players))];
+  return rows.map(r => r.map(escapeCsv).join(';')).join('\r\n');
 }
 </script>
 <script>
@@ -593,37 +844,134 @@ const SEED_STAFF = [
   { id: uid('s'), nombre: 'Nicolás Larcamón', rol: 'Entrenador principal', notas: '', fotoKey: null },
 ];
 
-function seedTeam(nombre, competicion, estadio, entrenador, sistema, colores) {
-  return {
-    id: uid('r'), nombre, competicion, estadio, entrenador, sistema, colores, notas: '', escudoKey: null,
-    jugadores: [
-      { id: uid('rj'), nombre: 'Jugador clave 1', dorsal: 9, posicion: 'DC' },
-      { id: uid('rj'), nombre: 'Jugador clave 2', dorsal: 10, posicion: 'MCO' },
-    ],
-  };
-}
+// Los 21 rivales del Real Sporting de Gijón en LaLiga Hypermotion (Segunda División) 2026-27,
+// con su estadio habitual y un color/abreviatura para dibujar un escudo provisional
+// (hasta que se suba el escudo real de cada equipo desde la ficha del rival).
+const RIVAL_INFO_2627 = {
+  'CE Sabadell FC': { abrev: 'SAB', color: '#c8102e', estadio: 'Estadi Nova Creu Alta' },
+  'Burgos CF': { abrev: 'BUR', color: '#1a1a1a', estadio: 'El Plantío' },
+  'CD Tenerife': { abrev: 'TFE', color: '#0033a0', estadio: 'Heliodoro Rodríguez López' },
+  'Girona FC': { abrev: 'GIR', color: '#cc0000', estadio: 'Montilivi' },
+  'CD Eldense': { abrev: 'ELD', color: '#003da5', estadio: 'Nuevo Pepico Amat' },
+  'FC Andorra': { abrev: 'AND', color: '#004b93', estadio: 'Estadi Nacional' },
+  'Real Oviedo': { abrev: 'OVI', color: '#1c3f94', estadio: 'Carlos Tartiere' },
+  'Celta Fortuna': { abrev: 'CEL', color: '#2a9df4', estadio: 'A Madroa' },
+  'Cádiz CF': { abrev: 'CAD', color: '#f2c500', estadio: 'Nuevo Mirandilla' },
+  'Albacete Balompié': { abrev: 'ALB', color: '#d0021b', estadio: 'Carlos Belmonte' },
+  'CD Castellón': { abrev: 'CAS', color: '#046a38', estadio: 'Nou Castalia' },
+  'AD Ceuta FC': { abrev: 'CEU', color: '#004b87', estadio: 'Alfonso Murube' },
+  'Real Valladolid': { abrev: 'VLL', color: '#5b2a86', estadio: 'José Zorrilla' },
+  'Real Sociedad B': { abrev: 'RSB', color: '#0058a8', estadio: 'Zubieta' },
+  'UD Las Palmas': { abrev: 'LPA', color: '#ffcd00', estadio: 'Gran Canaria' },
+  'UD Almería': { abrev: 'ALM', color: '#d81920', estadio: 'Power Horse Stadium' },
+  'Granada CF': { abrev: 'GRA', color: '#c60c30', estadio: 'Nuevo Los Cármenes' },
+  'SD Eibar': { abrev: 'EIB', color: '#00335e', estadio: 'Ipurua' },
+  'CD Leganés': { abrev: 'LEG', color: '#0072ce', estadio: 'Butarque' },
+  'RCD Mallorca': { abrev: 'MLL', color: '#e2001a', estadio: 'Son Moix' },
+  'Córdoba CF': { abrev: 'COR', color: '#1a7a3c', estadio: 'Nuevo Arcángel' },
+};
 
-const SEED_TEAMS = [
-  seedTeam('Rival Atlético A', 'Segunda División', 'Estadio Municipal A', 'Entrenador A', '4-4-2', 'Azul y blanco'),
-  seedTeam('Rival Deportivo B', 'Segunda División', 'Estadio Municipal B', 'Entrenador B', '4-3-3', 'Verde y negro'),
-  seedTeam('Rival Unión C', 'Segunda División', 'Estadio Municipal C', 'Entrenador C', '3-5-2', 'Amarillo y azul'),
+const SEED_TEAMS = Object.keys(RIVAL_INFO_2627).map(nombre => {
+  const info = RIVAL_INFO_2627[nombre];
+  return {
+    id: uid('r'), nombre, competicion: 'Segunda División', estadio: info.estadio,
+    entrenador: '', sistema: '', colores: '', abrev: info.abrev, colorHex: info.color,
+    notas: '', escudoKey: null, jugadores: [],
+  };
+});
+
+// Calendario oficial del Real Sporting de Gijón en LaLiga Hypermotion (Segunda División) 2026-27:
+// las 42 jornadas (ida y vuelta ante los 21 rivales), con resultado ya cerrado en las jornadas disputadas.
+const SEED_CALENDARIO_2627 = [
+  { jornada: 1, fecha: '2026-08-17', rival: 'CE Sabadell FC', condicion: 'local', resultado: { local: 0, visitante: 0 } },
+  { jornada: 2, fecha: '2026-08-23', rival: 'Burgos CF', condicion: 'local', resultado: { local: 1, visitante: 0 } },
+  { jornada: 3, fecha: '2026-08-28', rival: 'CD Tenerife', condicion: 'visitante', resultado: { local: 0, visitante: 1 } },
+  { jornada: 4, fecha: '2026-09-05', rival: 'Girona FC', condicion: 'local', resultado: { local: 0, visitante: 2 } },
+  { jornada: 5, fecha: '2026-09-13', rival: 'CD Eldense', condicion: 'local', resultado: { local: 0, visitante: 1 } },
+  { jornada: 6, fecha: '2026-09-19', rival: 'FC Andorra', condicion: 'visitante', resultado: { local: 1, visitante: 3 } },
+  { jornada: 7, fecha: '2026-09-27', rival: 'Real Oviedo', condicion: 'visitante', derbi: true, resultado: { local: 2, visitante: 0 } },
+  { jornada: 8, fecha: '2026-10-04', rival: 'Celta Fortuna', condicion: 'local' },
+  { jornada: 9, fecha: '2026-10-11', rival: 'Cádiz CF', condicion: 'visitante' },
+  { jornada: 10, fecha: '2026-10-18', rival: 'Albacete Balompié', condicion: 'local' },
+  { jornada: 11, fecha: '2026-10-25', rival: 'CD Castellón', condicion: 'visitante' },
+  { jornada: 12, fecha: '2026-11-01', rival: 'AD Ceuta FC', condicion: 'visitante' },
+  { jornada: 13, fecha: '2026-11-08', rival: 'Real Valladolid', condicion: 'local' },
+  { jornada: 14, fecha: '2026-11-15', rival: 'Real Sociedad B', condicion: 'visitante' },
+  { jornada: 15, fecha: '2026-11-22', rival: 'UD Las Palmas', condicion: 'local' },
+  { jornada: 16, fecha: '2026-11-29', rival: 'UD Almería', condicion: 'visitante' },
+  { jornada: 17, fecha: '2026-12-06', rival: 'Granada CF', condicion: 'local' },
+  { jornada: 18, fecha: '2026-12-13', rival: 'SD Eibar', condicion: 'visitante' },
+  { jornada: 19, fecha: '2026-12-20', rival: 'CD Leganés', condicion: 'local' },
+  { jornada: 20, fecha: '2027-01-03', rival: 'RCD Mallorca', condicion: 'visitante' },
+  { jornada: 21, fecha: '2027-01-10', rival: 'Córdoba CF', condicion: 'local' },
+  { jornada: 22, fecha: '2027-01-17', rival: 'Burgos CF', condicion: 'visitante' },
+  { jornada: 23, fecha: '2027-01-24', rival: 'CD Castellón', condicion: 'local' },
+  { jornada: 24, fecha: '2027-01-31', rival: 'UD Las Palmas', condicion: 'visitante' },
+  { jornada: 25, fecha: '2027-02-07', rival: 'AD Ceuta FC', condicion: 'local' },
+  { jornada: 26, fecha: '2027-02-14', rival: 'Real Valladolid', condicion: 'visitante' },
+  { jornada: 27, fecha: '2027-02-21', rival: 'FC Andorra', condicion: 'local' },
+  { jornada: 28, fecha: '2027-02-28', rival: 'Girona FC', condicion: 'visitante' },
+  { jornada: 29, fecha: '2027-03-07', rival: 'Cádiz CF', condicion: 'local' },
+  { jornada: 30, fecha: '2027-03-14', rival: 'CD Eldense', condicion: 'visitante' },
+  { jornada: 31, fecha: '2027-03-21', rival: 'RCD Mallorca', condicion: 'local' },
+  { jornada: 32, fecha: '2027-03-28', rival: 'Celta Fortuna', condicion: 'visitante' },
+  { jornada: 33, fecha: '2027-04-04', rival: 'CD Tenerife', condicion: 'local' },
+  { jornada: 34, fecha: '2027-04-11', rival: 'Real Sociedad B', condicion: 'local' },
+  { jornada: 35, fecha: '2027-04-18', rival: 'CE Sabadell FC', condicion: 'visitante' },
+  { jornada: 36, fecha: '2027-04-25', rival: 'Real Oviedo', condicion: 'local', derbi: true },
+  { jornada: 37, fecha: '2027-05-02', rival: 'CD Leganés', condicion: 'visitante' },
+  { jornada: 38, fecha: '2027-05-09', rival: 'Granada CF', condicion: 'visitante' },
+  { jornada: 39, fecha: '2027-05-16', rival: 'SD Eibar', condicion: 'local' },
+  { jornada: 40, fecha: '2027-05-23', rival: 'Albacete Balompié', condicion: 'visitante' },
+  { jornada: 41, fecha: '2027-05-30', rival: 'UD Almería', condicion: 'local' },
+  { jornada: 42, fecha: '2027-06-06', rival: 'Córdoba CF', condicion: 'visitante' },
 ];
 
+function resultadoSporting(item) {
+  if (!item.resultado) return null;
+  const golesSp = item.condicion === 'local' ? item.resultado.local : item.resultado.visitante;
+  const golesRival = item.condicion === 'local' ? item.resultado.visitante : item.resultado.local;
+  if (golesSp > golesRival) return 'victoria';
+  if (golesSp < golesRival) return 'derrota';
+  return 'empate';
+}
+
+// Elige un once inicial cuyo reparto de líneas encaje con el sistema dado (p.ej. 1 portero,
+// no dos), en vez de tomar sin más a los 11 primeros de la lista.
+function elegirOnceEquilibrado(players, sistema) {
+  const tpl = FORMATIONS[sistema] || [];
+  const need = { POR: 0, DEF: 0, MED: 0, DEL: 0 };
+  tpl.forEach(s => { need[s.line] = (need[s.line] || 0) + 1; });
+  const byLine = { POR: [], DEF: [], MED: [], DEL: [], SIN: [] };
+  players.forEach(p => { (byLine[posicionALinea(p.posicion)] || byLine.SIN).push(p); });
+  const elegidos = [];
+  const usados = new Set();
+  ['POR', 'DEF', 'MED', 'DEL'].forEach(line => {
+    byLine[line].slice(0, need[line] || 0).forEach(p => { elegidos.push(p); usados.add(p.id); });
+  });
+  const restantes = players.filter(p => !usados.has(p.id));
+  while (elegidos.length < 11 && restantes.length) elegidos.push(restantes.shift());
+  return elegidos;
+}
+
 function seedMatch(teams, players) {
-  const rival = teams[0];
-  const titularesIds = players.slice(0, 11).map(p => p.id);
-  const titulares = players.slice(0, 11);
-  const suplentes = players.slice(11, 18).map(p => p.id);
+  const proximaJornada = SEED_CALENDARIO_2627.find(c => !c.resultado) || SEED_CALENDARIO_2627[0];
+  const rival = teams.find(t => t.nombre === proximaJornada.rival) || teams[0];
+  const titulares = elegirOnceEquilibrado(players, '4-2-3-1');
+  const titularesIds = titulares.map(p => p.id);
+  const titSet = new Set(titularesIds);
+  const resto = players.filter(p => !titSet.has(p.id));
+  const suplentes = resto.slice(0, 7).map(p => p.id);
   const fichas = aplicarFormacion(titulares, '4-2-3-1');
   return [{
     id: uid('m'),
     rivalId: rival.id,
-    fecha: new Date(Date.now() + 6 * 86400000).toISOString().slice(0, 10),
+    fecha: proximaJornada.fecha,
     hora: '18:00',
     competicion: 'Segunda División',
-    jornada: 7,
-    condicion: 'local',
-    estadio: 'El Molinón',
+    jornada: proximaJornada.jornada,
+    condicion: proximaJornada.condicion,
+    estadio: proximaJornada.condicion === 'local' ? 'El Molinón' : rival.estadio,
     plan: {
       analisisRival: { fortalezas: '', debilidades: '', jugadoresClave: '' },
       fases: { atqOrg: '', defOrg: '', transOf: '', transDef: '' },
@@ -631,7 +979,7 @@ function seedMatch(teams, players) {
       instrucciones: '',
       notas: '',
     },
-    convocatoria: { convocados: players.slice(0, 20).map(p => p.id), titulares: titularesIds, suplentes },
+    convocatoria: { convocados: titularesIds.concat(resto.slice(0, 9).map(p => p.id)), titulares: titularesIds, suplentes },
     pizarras: [
       { id: uid('pz'), nombre: 'Ofensiva', sistema: '4-2-3-1', fichas, dibujos: [] },
     ],
@@ -640,7 +988,7 @@ function seedMatch(teams, players) {
 }
 </script>
 <script>
-const SEED_VIDEOS = { items: [], playlists: [] };
+const SEED_VIDEOS = { items: [] };
 const SEED_USERS = [];
 const SEED_SETTINGS = { permissions: defaultPermissions(), clubInfo: { nombre: 'Real Sporting de Gijón', temporada: '2026-27' } };
 const SEED_ACTIVITY = [];
@@ -662,6 +1010,8 @@ const CATEGORIAS_CLIP = [
   { key: 'error', label: 'Error' },
   { key: 'otro', label: 'Otro' },
 ];
+
+const JORNADAS_LIGA = Array.from({ length: 42 }, (_, i) => i + 1);
 </script>
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useRef, useMemo, useCallback, createContext, useContext, Fragment } = React;
@@ -1247,32 +1597,87 @@ function PlayerCard({ player, onClick }) {
   );
 }
 
+// Bandas horizontales por línea (POR cerca de la portería izquierda, DEL cerca de la
+// derecha), pensadas para el mismo SVG 105x68 que usa la pizarra táctica (dos áreas visibles).
+const PITCH_LINE_BANDS = {
+  POR: { x: 8, colDX: 7, perCol: 4 },
+  DEF: { x: 26, colDX: 8, perCol: 5 },
+  MED: { x: 55, colDX: 9, perCol: 5 },
+  DEL: { x: 83, colDX: 8, perCol: 5 },
+};
+
+// Reparte "count" jugadores de una línea en una o varias columnas dentro de su banda,
+// para que no se amontonen cuando hay muchos jugadores en la misma posición.
+function computeLineSlots(count, centerX, colDX, perCol) {
+  if (!count) return [];
+  const numCols = Math.max(1, Math.ceil(count / perCol));
+  const base = Math.floor(count / numCols);
+  const rem = count % numCols;
+  const marginY = 8, maxY = 68 - marginY;
+  const slots = [];
+  for (let ci = 0; ci < numCols; ci++) {
+    const size = base + (ci < rem ? 1 : 0);
+    const x = centerX + (ci - (numCols - 1) / 2) * colDX;
+    for (let i = 0; i < size; i++) {
+      const y = size === 1 ? 34 : marginY + (i * (maxY - marginY)) / (size - 1);
+      slots.push({ x, y });
+    }
+  }
+  return slots;
+}
+
 function FieldPitchOverview({ players }) {
-  const groups = { POR: [], DEF: [], MED: [], DEL: [] };
-  players.forEach(p => { const l = posicionALinea(p.posicion); if (groups[l]) groups[l].push(p); });
-  const rows = [
-    { key: 'DEL', y: 12 }, { key: 'MED', y: 34 }, { key: 'DEF', y: 56 }, { key: 'POR', y: 78 },
-  ];
+  const { setPlayers, canDo } = useAppData();
+  const canEdit = canDo('plantilla', 'editar');
+  const svgRef = useRef(null);
+  const [dragId, setDragId] = useState(null);
+
+  const defaultPos = useMemo(() => {
+    const groups = { POR: [], DEF: [], MED: [], DEL: [] };
+    players.slice().sort((a, b) => a.dorsal - b.dorsal).forEach(p => {
+      const l = posicionALinea(p.posicion);
+      if (groups[l]) groups[l].push(p);
+    });
+    const pos = {};
+    Object.keys(groups).forEach(line => {
+      const band = PITCH_LINE_BANDS[line];
+      const slots = computeLineSlots(groups[line].length, band.x, band.colDX, band.perCol);
+      groups[line].forEach((p, i) => { pos[p.id] = slots[i]; });
+    });
+    return pos;
+  }, [players]);
+
+  function onTokenPointerDown(e, playerId) {
+    e.stopPropagation();
+    if (!canEdit) return;
+    e.target.setPointerCapture(e.pointerId);
+    setDragId(playerId);
+  }
+  function onSvgPointerMove(e) {
+    if (!dragId) return;
+    const pt = getSvgPoint(svgRef.current, e.clientX, e.clientY);
+    const x = clamp(pt.x, 3, 102), y = clamp(pt.y, 3, 65);
+    setPlayers(list => list.map(p => p.id === dragId ? { ...p, campoPos: { x, y } } : p));
+  }
+  function onSvgPointerUp() { setDragId(null); }
+
+  const visibles = players.filter(p => posicionALinea(p.posicion) !== 'SIN');
+
   return (
     <div className="card p-3 overflow-hidden">
-      <svg viewBox="0 0 105 90" className="w-full h-auto" style={{ maxHeight: 480 }}>
-        <rect x="0" y="0" width="105" height="90" fill="var(--pitch)" />
-        <rect x="2" y="2" width="101" height="86" fill="none" stroke="var(--pitch-line)" strokeWidth="0.4" />
-        <line x1="2" y1="45" x2="103" y2="45" stroke="var(--pitch-line)" strokeWidth="0.3" />
-        <circle cx="52.5" cy="45" r="9" fill="none" stroke="var(--pitch-line)" strokeWidth="0.3" />
-        {rows.map(row => {
-          const list = groups[row.key];
-          if (!list.length) return null;
-          const gap = 105 / (list.length + 1);
-          return list.map((p, i) => (
-            <g key={p.id} transform={'translate(' + (gap * (i + 1)) + ',' + row.y + ')'}>
-              <circle r="5.2" fill="var(--surface)" stroke="var(--club-red)" strokeWidth="0.6" />
-              <text textAnchor="middle" dy="1.6" fontSize="4.4" fontWeight="700" fill="var(--club-red)">{p.dorsal}</text>
-              <text textAnchor="middle" y="8.5" fontSize="2.9" fill="#fff">{p.nombre.split(' ').slice(-1)[0]}</text>
-            </g>
-          ));
+      <svg ref={svgRef} viewBox="0 0 105 68" className="w-full h-auto touch-none select-none"
+        style={{ background: 'var(--pitch)', maxHeight: 480, borderRadius: 8 }}
+        onPointerMove={onSvgPointerMove} onPointerUp={onSvgPointerUp} onPointerLeave={onSvgPointerUp}>
+        <PitchMarkings />
+        {visibles.map(p => {
+          const c = p.campoPos || defaultPos[p.id] || { x: 52.5, y: 34 };
+          return (
+            <FichaToken key={p.id} x={c.x} y={c.y} dorsal={p.dorsal} nombre={p.nombre}
+              onPointerDown={e => onTokenPointerDown(e, p.id)} />
+          );
         })}
       </svg>
+      {canEdit && <p className="text-xs text-muted mt-2">Arrastra a los jugadores para reordenarlos por el campo; la posición se guarda automáticamente.</p>}
     </div>
   );
 }
@@ -1522,11 +1927,79 @@ function teamFormFields() {
   ];
 }
 
+function TeamShield({ team, size, shape }) {
+  const { getPhoto } = usePhotos();
+  const dim = size || 44;
+  const radiusClass = shape === 'circle' ? 'rounded-full' : 'rounded-lg';
+  const url = team && team.escudoKey ? getPhoto(team.escudoKey) : null;
+  if (url) {
+    return <img src={url} alt="" style={{ width: dim, height: dim, objectFit: 'cover' }} className={radiusClass + ' shrink-0'} />;
+  }
+  return (
+    <div className={radiusClass + ' shrink-0 flex items-center justify-center font-display font-bold'}
+      style={{ width: dim, height: dim, background: (team && team.colorHex) || 'var(--surface-2)', color: '#fff', fontSize: dim * 0.3, letterSpacing: '0.02em' }}>
+      {(team && team.abrev) || <Icon name="shield" size={dim * 0.5} style={{ color: 'var(--text-muted)' }} />}
+    </div>
+  );
+}
+
+function CalendarioLigaScreen({ teams }) {
+  const findRival = (nombre) => teams.find(t => t.nombre === nombre);
+  const vueltas = [
+    { titulo: '1ª vuelta', items: SEED_CALENDARIO_2627.filter(c => c.jornada <= 21) },
+    { titulo: '2ª vuelta', items: SEED_CALENDARIO_2627.filter(c => c.jornada > 21) },
+  ];
+  return (
+    <div className="space-y-5">
+      {vueltas.map(v => (
+        <div key={v.titulo}>
+          <h2 className="font-display font-semibold text-sm text-muted uppercase tracking-wide mb-2">{v.titulo}</h2>
+          <div className="space-y-1.5">
+            {v.items.map(item => {
+              const rival = findRival(item.rival);
+              const estadio = item.condicion === 'local' ? 'El Molinón' : (rival && rival.estadio) || '?';
+              const resultado = resultadoSporting(item);
+              const badgeStyle = resultado === 'victoria' ? { color: 'var(--ok)', background: 'var(--ok-bg)' }
+                : resultado === 'derrota' ? { color: 'var(--danger)', background: 'var(--danger-bg)' }
+                : resultado === 'empate' ? { color: 'var(--info)', background: 'var(--info-bg)' } : null;
+              return (
+                <div key={item.jornada} className="card px-3 py-2 flex items-center gap-3 flex-wrap">
+                  <span className="text-xs font-semibold text-muted w-10 shrink-0">J{item.jornada}</span>
+                  <span className="text-xs text-muted tabular w-24 shrink-0">{fmtFecha(item.fecha)}</span>
+                  <TeamShield team={rival} size={30} />
+                  <div className="min-w-0 flex-1">
+                    <div className="font-medium text-sm truncate">
+                      {item.rival}
+                      {item.derbi && <span className="badge ml-2" style={{ background: 'var(--club-red)', color: '#fff' }}>Derbi asturiano</span>}
+                    </div>
+                    <div className="text-xs text-muted truncate">{estadio}</div>
+                  </div>
+                  <span className="icon-btn" style={{ pointerEvents: 'none' }} title={item.condicion === 'local' ? 'Local' : 'Visitante'}>
+                    <Icon name={item.condicion === 'local' ? 'home' : 'map'} size={14} />
+                  </span>
+                  {item.resultado ? (
+                    <span className="badge tabular" style={badgeStyle}>
+                      {item.resultado.local + ' - ' + item.resultado.visitante}
+                    </span>
+                  ) : (
+                    <span className="badge" style={{ background: 'var(--surface-2)', color: 'var(--text-muted)' }}>Por jugar</span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function EquiposScreen() {
   const { teams, setTeams, canDo, pushActivity } = useAppData();
   const { savePhoto, deletePhoto } = usePhotos();
   const toast = useToast();
   const confirm = useConfirm();
+  const [vista, setVista] = useState('rivales');
   const [query, setQuery] = useState('');
   const [filtroComp, setFiltroComp] = useState('');
   const [editingTeam, setEditingTeam] = useState(undefined);
@@ -1568,33 +2041,45 @@ function EquiposScreen() {
     <div className="p-4 md:p-6 max-w-6xl mx-auto space-y-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <h1 className="font-display text-2xl font-bold">Equipos rivales</h1>
-        {canEdit && <button className="btn btn-primary" onClick={() => setEditingTeam(null)}><Icon name="plus" size={16} />Añadir equipo</button>}
+        {vista === 'rivales' && canEdit && <button className="btn btn-primary" onClick={() => setEditingTeam(null)}><Icon name="plus" size={16} />Añadir equipo</button>}
       </div>
-      <div className="flex flex-wrap gap-3">
-        <div className="w-full sm:w-64"><SearchInput value={query} onChange={setQuery} placeholder="Buscar equipo…" /></div>
-        <select className="field-input w-auto" value={filtroComp} onChange={e => setFiltroComp(e.target.value)}>
-          <option value="">Todas las competiciones</option>
-          {competiciones.map(c => <option key={c} value={c}>{c}</option>)}
-        </select>
+
+      <div className="flex gap-1 surface-2 rounded-lg p-1 w-fit flex-wrap">
+        <button onClick={() => setVista('rivales')} className="px-3 py-1.5 rounded-lg text-sm font-medium" style={{ background: vista === 'rivales' ? 'var(--club-red)' : 'transparent', color: vista === 'rivales' ? '#fff' : 'var(--text)' }}>Rivales</button>
+        <button onClick={() => setVista('calendario')} className="px-3 py-1.5 rounded-lg text-sm font-medium" style={{ background: vista === 'calendario' ? 'var(--club-red)' : 'transparent', color: vista === 'calendario' ? '#fff' : 'var(--text)' }}>Calendario 26-27</button>
       </div>
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-        {filtered.map(t => (
-          <button key={t.id} onClick={() => setDetailTeam(t)} className="card p-4 text-left hover:shadow-md transition-shadow">
-            <div className="flex items-center gap-3 mb-2">
-              <Avatar fotoKey={t.escudoKey} shape="square" size={44} />
-              <div className="min-w-0">
-                <div className="font-semibold truncate">{t.nombre}</div>
-                <div className="text-xs text-muted truncate">{t.competicion || '—'}</div>
-              </div>
-            </div>
-            <div className="text-xs text-muted flex flex-wrap gap-x-3 gap-y-1">
-              <span>{t.estadio || 'Estadio ?'}</span>
-              <span>Sistema {t.sistema || '?'}</span>
-            </div>
-          </button>
-        ))}
-        {!filtered.length && <EmptyState icon="shield" text="No hay equipos que coincidan." />}
-      </div>
+
+      {vista === 'calendario' ? (
+        <CalendarioLigaScreen teams={teams} />
+      ) : (
+        <React.Fragment>
+          <div className="flex flex-wrap gap-3">
+            <div className="w-full sm:w-64"><SearchInput value={query} onChange={setQuery} placeholder="Buscar equipo…" /></div>
+            <select className="field-input w-auto" value={filtroComp} onChange={e => setFiltroComp(e.target.value)}>
+              <option value="">Todas las competiciones</option>
+              {competiciones.map(c => <option key={c} value={c}>{c}</option>)}
+            </select>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+            {filtered.map(t => (
+              <button key={t.id} onClick={() => setDetailTeam(t)} className="card p-4 text-left hover:shadow-md transition-shadow">
+                <div className="flex items-center gap-3 mb-2">
+                  <TeamShield team={t} size={44} />
+                  <div className="min-w-0">
+                    <div className="font-semibold truncate">{t.nombre}</div>
+                    <div className="text-xs text-muted truncate">{t.competicion || '—'}</div>
+                  </div>
+                </div>
+                <div className="text-xs text-muted flex flex-wrap gap-x-3 gap-y-1">
+                  <span>{t.estadio || 'Estadio ?'}</span>
+                  <span>Sistema {t.sistema || '?'}</span>
+                </div>
+              </button>
+            ))}
+            {!filtered.length && <EmptyState icon="shield" text="No hay equipos que coincidan." />}
+          </div>
+        </React.Fragment>
+      )}
 
       {detailTeam && (
         <TeamDetailModal team={detailTeam} canEdit={canEdit} canDelete={canDelete}
@@ -1656,7 +2141,7 @@ function TeamDetailModal({ team, canEdit, canDelete, onClose, onEdit, onDelete, 
   return (
     <Modal title={team.nombre} onClose={onClose} wide>
       <div className="flex items-center gap-3 mb-4">
-        <Avatar fotoKey={team.escudoKey} shape="square" size={56} />
+        <TeamShield team={team} size={56} />
         <div>
           <div className="font-display text-lg font-bold">{team.nombre}</div>
           <div className="text-sm text-muted">{team.competicion || '—'}</div>
@@ -1867,10 +2352,13 @@ function TextBlock({ label, value, onChange, rows, disabled }) {
 }
 
 function PlanTab({ match, setMatches, canEdit }) {
-  const { matches } = useAppData();
+  const { matches, teams } = useAppData();
   const toast = useToast();
   const [saving, setSaving] = useState(false);
+  const [exportingPdf, setExportingPdf] = useState(false);
+  const printRef = useRef(null);
   const plan = match.plan;
+  const rival = teams.find(t => t.id === match.rivalId);
   function setPlan(patch) {
     updateMatch(setMatches, match.id, m => ({ ...m, plan: { ...m.plan, ...patch } }));
   }
@@ -1888,49 +2376,80 @@ function PlanTab({ match, setMatches, canEdit }) {
       setSaving(false);
     }
   }
+  async function exportPlanPdf() {
+    setExportingPdf(true);
+    try {
+      await exportNodeToPdf(pdfFileName('plan_partido', rival), printRef.current);
+      toast.success('Plan de partido exportado en PDF');
+    } catch (e) {
+      toast.error(e && e.message === 'sin_pdf' ? 'La exportación a PDF no está disponible aquí' : 'No se pudo exportar el PDF');
+    } finally {
+      setExportingPdf(false);
+    }
+  }
   return (
     <div className="space-y-6 max-w-3xl">
-      {canEdit && (
-        <div className="flex justify-end">
+      <div className="flex justify-end gap-2">
+        {canEdit && (
           <button className="btn btn-primary" onClick={guardarPlan} disabled={saving}>
             <Icon name="save" size={15} />{saving ? 'Guardando…' : 'Guardar plan'}
           </button>
-        </div>
-      )}
-      <div>
-        <h3 className="font-display font-semibold text-lg mb-2">Análisis del rival</h3>
-        <div className="grid gap-3">
-          <TextBlock label="Fortalezas" value={plan.analisisRival.fortalezas} disabled={!canEdit} onChange={v => setNested('analisisRival', 'fortalezas', v)} />
-          <TextBlock label="Debilidades" value={plan.analisisRival.debilidades} disabled={!canEdit} onChange={v => setNested('analisisRival', 'debilidades', v)} />
-          <TextBlock label="Jugadores clave" value={plan.analisisRival.jugadoresClave} disabled={!canEdit} onChange={v => setNested('analisisRival', 'jugadoresClave', v)} />
-        </div>
+        )}
+        <button className="btn btn-secondary" onClick={exportPlanPdf} disabled={exportingPdf}>
+          <Icon name="download" size={15} />{exportingPdf ? 'Generando PDF…' : 'Exportar PDF'}
+        </button>
       </div>
-      <div>
-        <h3 className="font-display font-semibold text-lg mb-2">Fases del juego</h3>
-        <div className="grid sm:grid-cols-2 gap-3">
-          <TextBlock label="Ataque organizado" value={plan.fases.atqOrg} disabled={!canEdit} onChange={v => setNested('fases', 'atqOrg', v)} />
-          <TextBlock label="Defensa organizada" value={plan.fases.defOrg} disabled={!canEdit} onChange={v => setNested('fases', 'defOrg', v)} />
-          <TextBlock label="Transición ofensiva" value={plan.fases.transOf} disabled={!canEdit} onChange={v => setNested('fases', 'transOf', v)} />
-          <TextBlock label="Transición defensiva" value={plan.fases.transDef} disabled={!canEdit} onChange={v => setNested('fases', 'transDef', v)} />
+      <div ref={printRef} className="space-y-6">
+        <div>
+          <h3 className="font-display font-semibold text-lg mb-2">Análisis del rival</h3>
+          <div className="grid gap-3">
+            <TextBlock label="Fortalezas" value={plan.analisisRival.fortalezas} disabled={!canEdit} onChange={v => setNested('analisisRival', 'fortalezas', v)} />
+            <TextBlock label="Debilidades" value={plan.analisisRival.debilidades} disabled={!canEdit} onChange={v => setNested('analisisRival', 'debilidades', v)} />
+            <TextBlock label="Jugadores clave" value={plan.analisisRival.jugadoresClave} disabled={!canEdit} onChange={v => setNested('analisisRival', 'jugadoresClave', v)} />
+          </div>
         </div>
-      </div>
-      <div>
-        <h3 className="font-display font-semibold text-lg mb-2">Balón parado</h3>
-        <div className="grid sm:grid-cols-2 gap-3">
-          <TextBlock label="ABP ofensivo" value={plan.abp.ofensivo} disabled={!canEdit} onChange={v => setNested('abp', 'ofensivo', v)} />
-          <TextBlock label="ABP defensivo" value={plan.abp.defensivo} disabled={!canEdit} onChange={v => setNested('abp', 'defensivo', v)} />
+        <div>
+          <h3 className="font-display font-semibold text-lg mb-2">Fases del juego</h3>
+          <div className="grid sm:grid-cols-2 gap-3">
+            <TextBlock label="Ataque organizado" value={plan.fases.atqOrg} disabled={!canEdit} onChange={v => setNested('fases', 'atqOrg', v)} />
+            <TextBlock label="Defensa organizada" value={plan.fases.defOrg} disabled={!canEdit} onChange={v => setNested('fases', 'defOrg', v)} />
+            <TextBlock label="Transición ofensiva" value={plan.fases.transOf} disabled={!canEdit} onChange={v => setNested('fases', 'transOf', v)} />
+            <TextBlock label="Transición defensiva" value={plan.fases.transDef} disabled={!canEdit} onChange={v => setNested('fases', 'transDef', v)} />
+          </div>
         </div>
+        <div>
+          <h3 className="font-display font-semibold text-lg mb-2">Balón parado</h3>
+          <div className="grid sm:grid-cols-2 gap-3">
+            <TextBlock label="ABP ofensivo" value={plan.abp.ofensivo} disabled={!canEdit} onChange={v => setNested('abp', 'ofensivo', v)} />
+            <TextBlock label="ABP defensivo" value={plan.abp.defensivo} disabled={!canEdit} onChange={v => setNested('abp', 'defensivo', v)} />
+          </div>
+        </div>
+        <TextBlock label="Instrucciones individuales" value={plan.instrucciones} disabled={!canEdit} onChange={v => setPlan({ instrucciones: v })} />
+        <TextBlock label="Notas" value={plan.notas} disabled={!canEdit} onChange={v => setPlan({ notas: v })} />
       </div>
-      <TextBlock label="Instrucciones individuales" value={plan.instrucciones} disabled={!canEdit} onChange={v => setPlan({ instrucciones: v })} />
-      <TextBlock label="Notas" value={plan.notas} disabled={!canEdit} onChange={v => setPlan({ notas: v })} />
     </div>
   );
 }
 
 function ConvocatoriaTab({ match, setMatches, canEdit }) {
-  const { players } = useAppData();
+  const { players, teams } = useAppData();
   const conv = match.convocatoria;
   const toast = useToast();
+  const [exportingPdf, setExportingPdf] = useState(false);
+  const printRef = useRef(null);
+  const rival = teams.find(t => t.id === match.rivalId);
+
+  async function exportConvocatoriaPdf() {
+    setExportingPdf(true);
+    try {
+      await exportNodeToPdf(pdfFileName('convocatoria', rival), printRef.current);
+      toast.success('Convocatoria exportada en PDF');
+    } catch (e) {
+      toast.error(e && e.message === 'sin_pdf' ? 'La exportación a PDF no está disponible aquí' : 'No se pudo exportar el PDF');
+    } finally {
+      setExportingPdf(false);
+    }
+  }
 
   function toggleConvocado(id) {
     updateMatch(setMatches, match.id, m => {
@@ -1960,45 +2479,52 @@ function ConvocatoriaTab({ match, setMatches, canEdit }) {
 
   return (
     <div className="space-y-5 max-w-3xl">
-      {avisos.length > 0 && (
-        <div className="card p-3 flex items-start gap-2" style={{ borderColor: 'var(--warn)', background: 'var(--warn-bg)' }}>
-          <Icon name="alertTriangle" style={{ color: 'var(--warn)' }} className="mt-0.5 shrink-0" />
-          <div className="text-sm">
-            <b>Atención:</b> {avisos.map(p => p.nombre + ' (' + ESTADOS[p.estado].label + ')').join(', ')}
+      <div className="flex justify-end">
+        <button className="btn btn-secondary" onClick={exportConvocatoriaPdf} disabled={exportingPdf}>
+          <Icon name="download" size={15} />{exportingPdf ? 'Generando PDF…' : 'Exportar PDF'}
+        </button>
+      </div>
+      <div ref={printRef} className="space-y-5">
+        {avisos.length > 0 && (
+          <div className="card p-3 flex items-start gap-2" style={{ borderColor: 'var(--warn)', background: 'var(--warn-bg)' }}>
+            <Icon name="alertTriangle" style={{ color: 'var(--warn)' }} className="mt-0.5 shrink-0" />
+            <div className="text-sm">
+              <b>Atención:</b> {avisos.map(p => p.nombre + ' (' + ESTADOS[p.estado].label + ')').join(', ')}
+            </div>
+          </div>
+        )}
+        <div>
+          <h3 className="font-display font-semibold text-lg mb-2">Convocados <span className="text-muted text-sm font-normal">({conv.convocados.length})</span></h3>
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+            {players.map(p => {
+              const on = conv.convocados.includes(p.id);
+              return (
+                <label key={p.id} className="flex items-center gap-2 card px-3 py-2 cursor-pointer" style={{ opacity: canEdit ? 1 : 0.85 }}>
+                  <input type="checkbox" checked={on} disabled={!canEdit} onChange={() => toggleConvocado(p.id)} className="w-4 h-4 shrink-0" />
+                  <Avatar fotoKey={p.fotoKey} dorsal={p.dorsal} size={28} />
+                  <span className="text-sm truncate flex-1">{p.nombre}</span>
+                  {(p.estado === 'lesionado' || p.estado === 'sancionado') && <Icon name="alertTriangle" size={14} style={{ color: 'var(--warn)' }} />}
+                </label>
+              );
+            })}
           </div>
         </div>
-      )}
-      <div>
-        <h3 className="font-display font-semibold text-lg mb-2">Convocados <span className="text-muted text-sm font-normal">({conv.convocados.length})</span></h3>
-        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-          {players.map(p => {
-            const on = conv.convocados.includes(p.id);
-            return (
-              <label key={p.id} className="flex items-center gap-2 card px-3 py-2 cursor-pointer" style={{ opacity: canEdit ? 1 : 0.85 }}>
-                <input type="checkbox" checked={on} disabled={!canEdit} onChange={() => toggleConvocado(p.id)} className="w-4 h-4 shrink-0" />
-                <Avatar fotoKey={p.fotoKey} dorsal={p.dorsal} size={28} />
-                <span className="text-sm truncate flex-1">{p.nombre}</span>
-                {(p.estado === 'lesionado' || p.estado === 'sancionado') && <Icon name="alertTriangle" size={14} style={{ color: 'var(--warn)' }} />}
-              </label>
-            );
-          })}
-        </div>
-      </div>
-      <div>
-        <h3 className="font-display font-semibold text-lg mb-2">Once titular <span className="text-muted text-sm font-normal">({conv.titulares.length}/11)</span></h3>
-        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-          {convocadosPlayers.map(p => {
-            const on = conv.titulares.includes(p.id);
-            return (
-              <button key={p.id} disabled={!canEdit} onClick={() => toggleTitular(p.id)}
-                className="flex items-center gap-2 rounded-lg px-3 py-2 text-left"
-                style={{ background: on ? 'var(--club-red)' : 'var(--surface-2)', color: on ? '#fff' : 'var(--text)' }}>
-                <Avatar fotoKey={p.fotoKey} dorsal={p.dorsal} size={26} />
-                <span className="text-sm truncate">{p.nombre}</span>
-              </button>
-            );
-          })}
-          {!convocadosPlayers.length && <p className="text-sm text-muted col-span-full">Selecciona primero a los convocados.</p>}
+        <div>
+          <h3 className="font-display font-semibold text-lg mb-2">Once titular <span className="text-muted text-sm font-normal">({conv.titulares.length}/11)</span></h3>
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+            {convocadosPlayers.map(p => {
+              const on = conv.titulares.includes(p.id);
+              return (
+                <button key={p.id} disabled={!canEdit} onClick={() => toggleTitular(p.id)}
+                  className="flex items-center gap-2 rounded-lg px-3 py-2 text-left"
+                  style={{ background: on ? 'var(--club-red)' : 'var(--surface-2)', color: on ? '#fff' : 'var(--text)' }}>
+                  <Avatar fotoKey={p.fotoKey} dorsal={p.dorsal} size={26} />
+                  <span className="text-sm truncate">{p.nombre}</span>
+                </button>
+              );
+            })}
+            {!convocadosPlayers.length && <p className="text-sm text-muted col-span-full">Selecciona primero a los convocados.</p>}
+          </div>
         </div>
       </div>
     </div>
@@ -2111,12 +2637,16 @@ function CampogramaTab({ match, setMatches, canEdit }) {
   const [drawTmp, setDrawTmp] = useState(null);
   const [pendingText, setPendingText] = useState(null);
   const [selected, setSelected] = useState(null);
+  const [exportingPdf, setExportingPdf] = useState(false);
+  const bancoRef = useRef(null);
 
   const pizarras = match.pizarras && match.pizarras.length ? match.pizarras : [{ id: uid('pz'), nombre: 'Principal', sistema: '4-4-2', fichas: [], dibujos: [] }];
   const idx = Math.min(activeIdx, pizarras.length - 1);
   const pizarra = pizarras[idx];
   const titulares = match.convocatoria.titulares.map(id => players.find(p => p.id === id)).filter(Boolean);
-  const suplentes = match.convocatoria.suplentes.map(id => players.find(p => p.id === id)).filter(Boolean);
+  const titularesSet = new Set(match.convocatoria.titulares);
+  // El banquillo son los convocados que no están ya representados en el campo (los titulares).
+  const suplentes = match.convocatoria.convocados.filter(id => !titularesSet.has(id)).map(id => players.find(p => p.id === id)).filter(Boolean);
 
   function setPizarras(next) {
     updateMatch(setMatches, match.id, m => ({ ...m, pizarras: next }));
@@ -2237,6 +2767,49 @@ function CampogramaTab({ match, setMatches, canEdit }) {
     }
   }
 
+  async function exportCampogramaPdf() {
+    setExportingPdf(true);
+    try {
+      // El campo (SVG) se rasteriza con el mismo método que usa el botón "PNG" (fiable y nítido);
+      // el banquillo se captura con su tamaño real. Combinar ambos a mano evita el problema de
+      // html2canvas con el layout responsive de dos columnas (campo + banquillo).
+      const pitchBlob = await exportSvgToPngBlob(svgRef.current);
+      const pitchDataUrl = await blobToDataUrl(pitchBlob);
+      const pitchImg = await loadImageElement(pitchDataUrl);
+      const bancoCanvas = await nodeToCanvas(bancoRef.current);
+
+      const pdf = await createPdfDocument();
+      const marginMm = 10;
+      const pageW = pdf.internal.pageSize.getWidth();
+      const pageH = pdf.internal.pageSize.getHeight();
+      const contentW = pageW - marginMm * 2;
+      const gapMm = 6;
+      const y = marginMm + 10;
+
+      let pitchW = contentW * 0.68;
+      let bancoW = contentW - pitchW - gapMm - 2;
+      let pitchH = pitchW * (pitchImg.height / pitchImg.width);
+      let bancoH = bancoW * (bancoCanvas.height / bancoCanvas.width);
+      const availableH = pageH - marginMm - y;
+      const rowH = Math.max(pitchH, bancoH);
+      if (rowH > availableH) {
+        const scale = availableH / rowH;
+        pitchW *= scale; pitchH *= scale; bancoW *= scale; bancoH *= scale;
+      }
+
+      pdf.setFontSize(14);
+      pdf.text(pizarra.nombre + ' · Sistema ' + pizarra.sistema, marginMm, marginMm + 4);
+      pdf.addImage(pitchDataUrl, 'PNG', marginMm, y, pitchW, pitchH);
+      pdf.addImage(bancoCanvas.toDataURL('image/png'), 'PNG', marginMm + pitchW + gapMm, y, bancoW, bancoH);
+      pdf.save('campograma_' + pizarra.nombre.replace(/\s+/g, '_') + '.pdf');
+      toast.success('Campograma exportado en PDF');
+    } catch (e) {
+      toast.error(e && e.message === 'sin_pdf' ? 'La exportación a PDF no está disponible aquí' : 'No se pudo exportar el PDF');
+    } finally {
+      setExportingPdf(false);
+    }
+  }
+
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-2">
@@ -2271,8 +2844,11 @@ function CampogramaTab({ match, setMatches, canEdit }) {
         {canEdit && <button className="icon-btn" title="Deshacer" onClick={() => updatePizarra({ dibujos: pizarra.dibujos.slice(0, -1) })}><Icon name="undo" size={16} /></button>}
         {canEdit && <button className="icon-btn" title="Borrar todo" onClick={async () => { if (await confirm({ title: 'Borrar dibujos', message: '¿Borrar todos los dibujos de esta pizarra?', danger: true, confirmLabel: 'Borrar' })) updatePizarra({ dibujos: [] }); }}><Icon name="eraser" size={16} /></button>}
         <button className="btn btn-secondary ml-auto" onClick={exportPng}><Icon name="download" size={15} />PNG</button>
+        <button className="btn btn-secondary" onClick={exportCampogramaPdf} disabled={exportingPdf}><Icon name="download" size={15} />{exportingPdf ? 'Generando PDF…' : 'PDF'}</button>
       </div>
 
+      <div className="space-y-3">
+      <p className="font-display font-semibold">{pizarra.nombre} · Sistema {pizarra.sistema}</p>
       <div className="flex flex-col lg:flex-row gap-4">
         <div className="flex-1 relative">
           <svg ref={svgRef} viewBox="0 0 105 68" className="w-full h-auto rounded-lg touch-none select-none" style={{ background: 'var(--pitch)', maxHeight: 560 }}
@@ -2299,8 +2875,8 @@ function CampogramaTab({ match, setMatches, canEdit }) {
             </div>
           )}
         </div>
-        <div className="w-full lg:w-56 shrink-0">
-          <div className="field-label mb-2">Banquillo</div>
+        <div ref={bancoRef} className="w-full lg:w-56 shrink-0">
+          <div className="field-label mb-2">Banquillo <span className="text-muted font-normal">({suplentes.length})</span></div>
           <div className="space-y-1.5">
             {suplentes.map(p => (
               <button key={p.id} onClick={() => poneEnJuego(p)} disabled={!canEdit} className="w-full flex items-center gap-2 card px-2.5 py-1.5 text-left hover:shadow-sm">
@@ -2313,17 +2889,21 @@ function CampogramaTab({ match, setMatches, canEdit }) {
           </div>
         </div>
       </div>
+      </div>
     </div>
   );
 }
 </script>
 <script type="text/babel" data-presets="react">
 function PostPartidoTab({ match, setMatches, canEdit }) {
-  const { players } = useAppData();
+  const { players, teams } = useAppData();
   const pp = match.postPartido;
   const toast = useToast();
   const [nuevoGol, setNuevoGol] = useState({ playerId: '', minuto: '' });
+  const [exportingPdf, setExportingPdf] = useState(false);
+  const printRef = useRef(null);
   const convocados = match.convocatoria.convocados.map(id => players.find(p => p.id === id)).filter(Boolean);
+  const rival = teams.find(t => t.id === match.rivalId);
 
   function setPP(patch) { updateMatch(setMatches, match.id, m => ({ ...m, postPartido: { ...m.postPartido, ...patch } })); }
   function addGol() {
@@ -2334,86 +2914,78 @@ function PostPartidoTab({ match, setMatches, canEdit }) {
   function removeGol(id) { setPP({ goleadores: pp.goleadores.filter(g => g.id !== id) }); }
   function setMinutos(playerId, val) { setPP({ minutos: { ...pp.minutos, [playerId]: val } }); }
 
+  async function exportPostPartidoPdf() {
+    setExportingPdf(true);
+    try {
+      await exportNodeToPdf(pdfFileName('post_partido', rival), printRef.current);
+      toast.success('Post-partido exportado en PDF');
+    } catch (e) {
+      toast.error(e && e.message === 'sin_pdf' ? 'La exportación a PDF no está disponible aquí' : 'No se pudo exportar el PDF');
+    } finally {
+      setExportingPdf(false);
+    }
+  }
+
   return (
     <div className="space-y-6 max-w-3xl">
-      <div className="flex items-end gap-3">
-        <div><label className="field-label mb-1 block">Sporting</label><input type="number" className="field-input" style={{ width: 80 }} disabled={!canEdit} value={pp.resultadoLocal} onChange={e => setPP({ resultadoLocal: e.target.value })} /></div>
-        <span className="font-display text-xl pb-2">–</span>
-        <div><label className="field-label mb-1 block">Rival</label><input type="number" className="field-input" style={{ width: 80 }} disabled={!canEdit} value={pp.resultadoVisitante} onChange={e => setPP({ resultadoVisitante: e.target.value })} /></div>
+      <div className="flex justify-end">
+        <button className="btn btn-secondary" onClick={exportPostPartidoPdf} disabled={exportingPdf}>
+          <Icon name="download" size={15} />{exportingPdf ? 'Generando PDF…' : 'Exportar PDF'}
+        </button>
       </div>
-
-      <div>
-        <h3 className="font-display font-semibold text-lg mb-2">Goleadores</h3>
-        <div className="space-y-1.5 mb-2">
-          {pp.goleadores.map(g => {
-            const p = players.find(x => x.id === g.playerId);
-            return (
-              <div key={g.id} className="flex items-center gap-2 surface-2 rounded-lg px-3 py-1.5 text-sm">
-                <span className="flex-1">{p ? p.nombre : '—'}</span>
-                <span className="tabular text-muted">{g.minuto ? g.minuto + "'" : ''}</span>
-                {canEdit && <button className="icon-btn" onClick={() => removeGol(g.id)}><Icon name="x" size={14} /></button>}
-              </div>
-            );
-          })}
+      <div ref={printRef} className="space-y-6">
+        <div className="flex items-end gap-3">
+          <div><label className="field-label mb-1 block">Sporting</label><input type="number" className="field-input" style={{ width: 80 }} disabled={!canEdit} value={pp.resultadoLocal} onChange={e => setPP({ resultadoLocal: e.target.value })} /></div>
+          <span className="font-display text-xl pb-2">–</span>
+          <div><label className="field-label mb-1 block">Rival</label><input type="number" className="field-input" style={{ width: 80 }} disabled={!canEdit} value={pp.resultadoVisitante} onChange={e => setPP({ resultadoVisitante: e.target.value })} /></div>
         </div>
-        {canEdit && (
-          <div className="flex gap-2">
-            <select className="field-input" value={nuevoGol.playerId} onChange={e => setNuevoGol(s => ({ ...s, playerId: e.target.value }))}>
-              <option value="">Jugador…</option>
-              {convocados.map(p => <option key={p.id} value={p.id}>{p.nombre}</option>)}
-            </select>
-            <input className="field-input" style={{ width: 90 }} placeholder="Minuto" value={nuevoGol.minuto} onChange={e => setNuevoGol(s => ({ ...s, minuto: e.target.value }))} />
-            <button className="btn btn-secondary" onClick={addGol}><Icon name="plus" size={15} /></button>
+
+        <div>
+          <h3 className="font-display font-semibold text-lg mb-2">Goleadores</h3>
+          <div className="space-y-1.5 mb-2">
+            {pp.goleadores.map(g => {
+              const p = players.find(x => x.id === g.playerId);
+              return (
+                <div key={g.id} className="flex items-center gap-2 surface-2 rounded-lg px-3 py-1.5 text-sm">
+                  <span className="flex-1">{p ? p.nombre : '—'}</span>
+                  <span className="tabular text-muted">{g.minuto ? g.minuto + "'" : ''}</span>
+                  {canEdit && <button className="icon-btn" onClick={() => removeGol(g.id)}><Icon name="x" size={14} /></button>}
+                </div>
+              );
+            })}
           </div>
-        )}
-      </div>
-
-      <div>
-        <h3 className="font-display font-semibold text-lg mb-2">Minutos jugados</h3>
-        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-          {convocados.map(p => (
-            <div key={p.id} className="flex items-center gap-2 card px-2.5 py-1.5">
-              <span className="text-sm truncate flex-1">{p.nombre}</span>
-              <input type="number" className="field-input" style={{ width: 60 }} disabled={!canEdit} value={pp.minutos[p.id] ?? ''} onChange={e => setMinutos(p.id, e.target.value)} />
+          {canEdit && (
+            <div className="flex gap-2">
+              <select className="field-input" value={nuevoGol.playerId} onChange={e => setNuevoGol(s => ({ ...s, playerId: e.target.value }))}>
+                <option value="">Jugador…</option>
+                {convocados.map(p => <option key={p.id} value={p.id}>{p.nombre}</option>)}
+              </select>
+              <input className="field-input" style={{ width: 90 }} placeholder="Minuto" value={nuevoGol.minuto} onChange={e => setNuevoGol(s => ({ ...s, minuto: e.target.value }))} />
+              <button className="btn btn-secondary" onClick={addGol}><Icon name="plus" size={15} /></button>
             </div>
-          ))}
+          )}
         </div>
-      </div>
 
-      <TextBlock label="Valoración del partido" value={pp.valoracion} disabled={!canEdit} rows={5} onChange={v => setPP({ valoracion: v })} />
+        <div>
+          <h3 className="font-display font-semibold text-lg mb-2">Minutos jugados</h3>
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+            {convocados.map(p => (
+              <div key={p.id} className="flex items-center gap-2 card px-2.5 py-1.5">
+                <span className="text-sm truncate flex-1">{p.nombre}</span>
+                <input type="number" className="field-input" style={{ width: 60 }} disabled={!canEdit} value={pp.minutos[p.id] ?? ''} onChange={e => setMinutos(p.id, e.target.value)} />
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <TextBlock label="Valoración del partido" value={pp.valoracion} disabled={!canEdit} rows={5} onChange={v => setPP({ valoracion: v })} />
+      </div>
     </div>
   );
 }
 
-function buildPlanHtml(match, rival, players) {
-  const p = match.plan;
-  const titulares = match.convocatoria.titulares.map(id => players.find(x => x.id === id)).filter(Boolean);
-  const suplentes = match.convocatoria.suplentes.map(id => players.find(x => x.id === id)).filter(Boolean);
-  const esc = (s) => String(s || '—').replace(/</g, '&lt;');
-  return '<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Plan de partido</title>' +
-    '<style>body{font-family:Arial,sans-serif;max-width:800px;margin:32px auto;color:#1c1c1a;line-height:1.5}' +
-    'h1{color:#D2001F;margin-bottom:0}h2{border-bottom:2px solid #D2001F;padding-bottom:4px;margin-top:28px}' +
-    '.meta{color:#6f6d66;margin-top:4px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}' +
-    'ul{margin:4px 0}li{margin-bottom:2px}@media print{body{margin:0}}</style></head><body>' +
-    '<h1>Real Sporting de Gijón vs ' + esc(rival && rival.nombre) + '</h1>' +
-    '<div class="meta">' + esc(match.competicion) + (match.jornada ? ' · Jornada ' + esc(match.jornada) : '') + ' · ' + esc(fmtFecha(match.fecha)) + ' ' + esc(match.hora) + ' · ' + esc(match.estadio) + '</div>' +
-    '<h2>Análisis del rival</h2>' +
-    '<p><b>Fortalezas:</b> ' + esc(p.analisisRival.fortalezas) + '</p>' +
-    '<p><b>Debilidades:</b> ' + esc(p.analisisRival.debilidades) + '</p>' +
-    '<p><b>Jugadores clave:</b> ' + esc(p.analisisRival.jugadoresClave) + '</p>' +
-    '<h2>Fases del juego</h2><div class="grid">' +
-    '<p><b>Ataque organizado:</b> ' + esc(p.fases.atqOrg) + '</p>' +
-    '<p><b>Defensa organizada:</b> ' + esc(p.fases.defOrg) + '</p>' +
-    '<p><b>Transición ofensiva:</b> ' + esc(p.fases.transOf) + '</p>' +
-    '<p><b>Transición defensiva:</b> ' + esc(p.fases.transDef) + '</p></div>' +
-    '<h2>Balón parado</h2>' +
-    '<p><b>Ofensivo:</b> ' + esc(p.abp.ofensivo) + '</p><p><b>Defensivo:</b> ' + esc(p.abp.defensivo) + '</p>' +
-    '<h2>Instrucciones individuales</h2><p>' + esc(p.instrucciones) + '</p>' +
-    '<h2>Convocatoria</h2>' +
-    '<p><b>Titulares:</b></p><ul>' + titulares.map(t => '<li>#' + t.dorsal + ' ' + esc(t.nombre) + ' (' + t.posicion + ')</li>').join('') + '</ul>' +
-    '<p><b>Suplentes:</b></p><ul>' + suplentes.map(t => '<li>#' + t.dorsal + ' ' + esc(t.nombre) + '</li>').join('') + '</ul>' +
-    '<h2>Notas</h2><p>' + esc(p.notas) + '</p>' +
-    '</body></html>';
+function pdfFileName(prefix, rival) {
+  return prefix + '_' + (rival ? rival.nombre.replace(/\s+/g, '_') : 'rival') + '.pdf';
 }
 </script>
 <script type="text/babel" data-presets="react">
@@ -2425,20 +2997,9 @@ const MATCH_TABS = [
 ];
 
 function MatchDetailScreen({ match, onBack, onDelete, canEdit, canDelete }) {
-  const { teams, players, setMatches } = useAppData();
-  const toast = useToast();
+  const { teams, setMatches } = useAppData();
   const [tab, setTab] = useState('plan');
   const rival = teams.find(t => t.id === match.rivalId);
-
-  async function exportInforme() {
-    try {
-      const html = buildPlanHtml(match, rival, players);
-      await offerDownload('plan_partido_' + (rival ? rival.nombre.replace(/\s+/g, '_') : 'rival') + '.html', html);
-      toast.success('Informe exportado. Ábrelo en el navegador para imprimirlo.');
-    } catch (e) {
-      toast.error(e && e.message === 'sin_descargas' ? 'Las descargas no están disponibles aquí' : 'No se pudo exportar el informe');
-    }
-  }
 
   return (
     <div className="p-4 md:p-6 max-w-6xl mx-auto space-y-4">
@@ -2450,7 +3011,6 @@ function MatchDetailScreen({ match, onBack, onDelete, canEdit, canDelete }) {
           </h1>
           <p className="text-xs text-muted">{fmtFecha(match.fecha)} · {match.hora} · {match.estadio || '—'}</p>
         </div>
-        <button className="btn btn-secondary" onClick={exportInforme}><Icon name="download" size={15} /><span className="hidden sm:inline">Exportar informe</span></button>
         {canDelete && <button className="btn btn-danger" onClick={onDelete}><Icon name="trash" size={15} /></button>}
       </div>
 
@@ -2475,7 +3035,6 @@ function MatchDetailScreen({ match, onBack, onDelete, canEdit, canDelete }) {
 </script>
 <script type="text/babel" data-presets="react">
 function VideoCard({ video, rival, onClick }) {
-  const info = parseVideoUrl(video.url);
   return (
     <button onClick={onClick} className="card p-4 text-left hover:shadow-md transition-shadow w-full">
       <div className="flex items-start gap-3">
@@ -2486,6 +3045,9 @@ function VideoCard({ video, rival, onClick }) {
           <div className="font-semibold truncate">{video.titulo}</div>
           <div className="text-xs text-muted truncate">{rival ? rival.nombre : ''} {video.fecha ? '· ' + fmtFecha(video.fecha) : ''}</div>
           <div className="flex flex-wrap gap-1 mt-1.5">
+            {video.categoria === 'liga' && video.jornada != null && video.jornada !== '' && <span className="badge" style={{ background: 'var(--info-bg)', color: 'var(--info)' }}>Jornada {video.jornada}</span>}
+            {video.categoria === 'pretemporada' && video.pretemporadaNum != null && video.pretemporadaNum !== '' && <span className="badge" style={{ background: 'var(--info-bg)', color: 'var(--info)' }}>Pretemporada {video.pretemporadaNum}</span>}
+            {video.archivoKey && <span className="badge" style={{ background: 'var(--surface-2)', color: 'var(--text-muted)' }}>Archivo subido</span>}
             {(video.etiquetas || []).slice(0, 3).map(t => <span key={t} className="badge" style={{ background: 'var(--surface-2)', color: 'var(--text-muted)' }}>{t}</span>)}
             {video.clips && video.clips.length > 0 && <span className="badge" style={{ background: 'var(--info-bg)', color: 'var(--info)' }}>{video.clips.length} clips</span>}
           </div>
@@ -2495,35 +3057,260 @@ function VideoCard({ video, rival, onClick }) {
   );
 }
 
+function VideoSourceField({ values, set }) {
+  const toast = useToast();
+  const [modo, setModo] = useState(values.archivoKey ? 'archivo' : 'url');
+  const [busy, setBusy] = useState(false);
+  const inputRef = useRef(null);
+
+  function elegirModo(m) {
+    if (m === modo) return;
+    setModo(m);
+    if (m === 'url' && values.archivoKey) {
+      storageDelete(values.archivoKey).catch(() => {});
+      set('archivoKey', '');
+      set('archivoNombre', '');
+    }
+  }
+
+  async function handleFile(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = '';
+    if (!file) return;
+    if (!file.type || !file.type.startsWith('video/')) { toast.error('Selecciona un archivo de vídeo'); return; }
+    setBusy(true);
+    try {
+      const dataUrl = await readFileAsDataUrl(file);
+      const oldKey = values.archivoKey;
+      const key = 'video:' + uid('vf');
+      await storageSet(key, dataUrl);
+      if (oldKey) storageDelete(oldKey).catch(() => {});
+      set('archivoKey', key);
+      set('archivoNombre', file.name);
+      set('url', '');
+    } catch (err) {
+      toast.error('No se pudo cargar el vídeo');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div>
+      <div className="field-label mb-1">Vídeo *</div>
+      <div className="flex gap-1 surface-2 rounded-lg p-1 w-fit mb-2">
+        <button type="button" onClick={() => elegirModo('url')} className="px-3 py-1 rounded-md text-sm font-medium" style={{ background: modo === 'url' ? 'var(--club-red)' : 'transparent', color: modo === 'url' ? '#fff' : 'var(--text)' }}>Enlace de YouTube</button>
+        <button type="button" onClick={() => elegirModo('archivo')} className="px-3 py-1 rounded-md text-sm font-medium" style={{ background: modo === 'archivo' ? 'var(--club-red)' : 'transparent', color: modo === 'archivo' ? '#fff' : 'var(--text)' }}>Subir desde el ordenador</button>
+      </div>
+      {modo === 'url' ? (
+        <input className="field-input" placeholder="https://www.youtube.com/watch?v=…" value={values.url || ''} onChange={e => set('url', e.target.value)} />
+      ) : (
+        <div className="flex items-center gap-2 flex-wrap">
+          <button type="button" className="btn btn-secondary" disabled={busy} onClick={() => inputRef.current.click()}>
+            <Icon name="upload" size={15} />{busy ? 'Cargando…' : (values.archivoKey ? 'Cambiar archivo' : 'Elegir archivo')}
+          </button>
+          {values.archivoNombre && <span className="text-sm text-muted truncate">{values.archivoNombre}</span>}
+          <input ref={inputRef} type="file" accept="video/*" className="hidden" onChange={handleFile} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function extraValidateVideo(values) {
+  if (!values.url && !values.archivoKey) return 'Indica un enlace de vídeo o sube un archivo';
+  return null;
+}
+
+function VideoQuickAddForm({ onAdd }) {
+  const toast = useToast();
+  const [modo, setModo] = useState('url');
+  const [url, setUrl] = useState('');
+  const [titulo, setTitulo] = useState('');
+  const [archivoKey, setArchivoKey] = useState('');
+  const [archivoNombre, setArchivoNombre] = useState('');
+  const [busy, setBusy] = useState(false);
+  const inputRef = useRef(null);
+
+  function elegirModo(m) {
+    if (m === modo) return;
+    setModo(m);
+    if (m === 'url' && archivoKey) {
+      storageDelete(archivoKey).catch(() => {});
+      setArchivoKey(''); setArchivoNombre('');
+    }
+  }
+
+  async function handleFile(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = '';
+    if (!file) return;
+    if (!file.type || !file.type.startsWith('video/')) { toast.error('Selecciona un archivo de vídeo'); return; }
+    setBusy(true);
+    try {
+      const dataUrl = await readFileAsDataUrl(file);
+      const oldKey = archivoKey;
+      const key = 'video:' + uid('vf');
+      await storageSet(key, dataUrl);
+      if (oldKey) storageDelete(oldKey).catch(() => {});
+      setArchivoKey(key);
+      setArchivoNombre(file.name);
+      setUrl('');
+    } catch (err) {
+      toast.error('No se pudo cargar el vídeo');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function submit() {
+    if (!titulo.trim()) { toast.error('Ponle un título al vídeo'); return; }
+    if (!url && !archivoKey) { toast.error('Indica un enlace de YouTube o sube un archivo'); return; }
+    onAdd({ titulo: titulo.trim(), url, archivoKey, archivoNombre });
+    setTitulo(''); setUrl(''); setArchivoKey(''); setArchivoNombre(''); setModo('url');
+  }
+
+  return (
+    <div className="surface-2 rounded-lg p-3 space-y-2">
+      <div className="flex gap-1 rounded-lg p-1 w-fit" style={{ background: 'var(--surface)' }}>
+        <button type="button" onClick={() => elegirModo('url')} className="px-2.5 py-1 rounded-md text-xs font-medium" style={{ background: modo === 'url' ? 'var(--club-red)' : 'transparent', color: modo === 'url' ? '#fff' : 'var(--text)' }}>Enlace de YouTube</button>
+        <button type="button" onClick={() => elegirModo('archivo')} className="px-2.5 py-1 rounded-md text-xs font-medium" style={{ background: modo === 'archivo' ? 'var(--club-red)' : 'transparent', color: modo === 'archivo' ? '#fff' : 'var(--text)' }}>Subir desde el ordenador</button>
+      </div>
+      <div className="flex flex-wrap gap-2">
+        {modo === 'url' ? (
+          <input className="field-input flex-1" style={{ minWidth: 180 }} placeholder="https://www.youtube.com/watch?v=…" value={url} onChange={e => setUrl(e.target.value)} />
+        ) : (
+          <div className="flex items-center gap-2 flex-wrap">
+            <button type="button" className="btn btn-secondary" disabled={busy} onClick={() => inputRef.current.click()}>
+              <Icon name="upload" size={14} />{busy ? 'Cargando…' : (archivoKey ? 'Cambiar archivo' : 'Elegir archivo')}
+            </button>
+            {archivoNombre && <span className="text-xs text-muted truncate">{archivoNombre}</span>}
+            <input ref={inputRef} type="file" accept="video/*" className="hidden" onChange={handleFile} />
+          </div>
+        )}
+        <input className="field-input flex-1" style={{ minWidth: 140 }} placeholder="Título del vídeo" value={titulo} onChange={e => setTitulo(e.target.value)} />
+        <button type="button" className="btn btn-primary" onClick={submit}><Icon name="plus" size={14} />Añadir</button>
+      </div>
+    </div>
+  );
+}
+
+function VideoAccordionSection({ titulo, videos, isOpen, onToggle, canEdit, onOpenVideo, onQuickAdd, rivalOf }) {
+  return (
+    <div className="card p-0" style={{ overflow: 'hidden' }}>
+      <button type="button" onClick={onToggle} className="w-full flex items-center justify-between px-4 py-3 text-left">
+        <span className="font-semibold">{titulo}</span>
+        <span className="flex items-center gap-2 text-sm text-muted">
+          {videos.length} vídeo{videos.length === 1 ? '' : 's'}
+          <Icon name={isOpen ? 'chevronDown' : 'chevronRight'} size={16} />
+        </span>
+      </button>
+      {isOpen && (
+        <div className="px-4 pb-4 space-y-3 border-t" style={{ borderColor: 'var(--border)' }}>
+          {videos.length > 0 && (
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-3">
+              {videos.map(v => <VideoCard key={v.id} video={v} rival={rivalOf(v)} onClick={() => onOpenVideo(v)} />)}
+            </div>
+          )}
+          {!videos.length && <p className="text-sm text-muted pt-3">Todavía no hay vídeos aquí.</p>}
+          {canEdit && <VideoQuickAddForm onAdd={onQuickAdd} />}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function VideotecaScreen() {
   const { videos, setVideos, matches, teams, players, canDo, pushActivity } = useAppData();
   const toast = useToast();
   const confirm = useConfirm();
   const [query, setQuery] = useState('');
-  const [filtroMatch, setFiltroMatch] = useState('');
+  const [ordenDir, setOrdenDir] = useState('asc');
   const [filtroJugador, setFiltroJugador] = useState('');
   const [filtroTag, setFiltroTag] = useState('');
   const [editing, setEditing] = useState(undefined);
   const [detail, setDetail] = useState(null);
-  const [tabView, setTabView] = useState('videos');
+  const [tabView, setTabView] = useState('pretemporada');
+  const [openJornada, setOpenJornada] = useState(null);
+  const sectionRefs = useRef({});
+  const [openPretemporada, setOpenPretemporada] = useState(null);
+  const sectionRefsPre = useRef({});
 
   const canEdit = canDo('videoteca', 'editar');
   const canDelete = canDo('videoteca', 'eliminar');
   const items = videos.items || [];
   const allTags = [...new Set(items.flatMap(v => v.etiquetas || []))];
+  const esCategoriaTab = tabView === 'liga' || tabView === 'pretemporada';
 
-  const filtered = items.filter(v => {
-    if (filtroMatch && v.matchId !== filtroMatch) return false;
+  const hayFiltroActivo = !!(query || filtroJugador || filtroTag);
+  function pasaFiltros(v) {
     if (filtroJugador && !(v.jugadores || []).includes(filtroJugador)) return false;
     if (filtroTag && !(v.etiquetas || []).includes(filtroTag)) return false;
     if (query && !v.titulo.toLowerCase().includes(query.toLowerCase())) return false;
     return true;
-  });
+  }
+
+  const itemsLiga = items.filter(v => v.categoria === 'liga').filter(pasaFiltros);
+  const jornadasOrdenadas = ordenDir === 'asc' ? JORNADAS_LIGA : [...JORNADAS_LIGA].slice().reverse();
+  const partidoDeJornada = (n) => SEED_CALENDARIO_2627.find(c => c.jornada === n);
+
+  const itemsPretemporada = items.filter(v => v.categoria === 'pretemporada').filter(pasaFiltros);
+  const pretemporadaNumsDisponibles = [...new Set(
+    items.filter(v => v.categoria === 'pretemporada' && v.pretemporadaNum != null && v.pretemporadaNum !== '').map(v => Number(v.pretemporadaNum))
+  )].sort((a, b) => a - b);
+  const siguientePretemporadaNum = (pretemporadaNumsDisponibles[pretemporadaNumsDisponibles.length - 1] || 0) + 1;
+  const seccionesPretemporada = [...new Set([...pretemporadaNumsDisponibles, siguientePretemporadaNum])].sort((a, b) => a - b);
+  const pretemporadaOrdenada = ordenDir === 'asc' ? seccionesPretemporada : [...seccionesPretemporada].reverse();
+
+  function irAJornada(valor) {
+    if (!valor) return;
+    const n = Number(valor);
+    setOpenJornada(n);
+    requestAnimationFrame(() => {
+      const el = sectionRefs.current[n];
+      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+  }
+
+  function irAPretemporada(valor) {
+    if (!valor) return;
+    const n = Number(valor);
+    setOpenPretemporada(n);
+    requestAnimationFrame(() => {
+      const el = sectionRefsPre.current[n];
+      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+  }
+
+  function quickAddVideoJornada(jornada, data) {
+    const nv = {
+      id: uid('v'), jugadores: [], clips: [], etiquetas: [],
+      categoria: 'liga', jornada, titulo: data.titulo,
+      url: data.url || '', archivoKey: data.archivoKey || undefined, archivoNombre: data.archivoNombre || undefined,
+    };
+    setVideos(v => ({ ...v, items: [...v.items, nv] }));
+    pushActivity('Añadió vídeo', data.titulo);
+    toast.success('Guardado');
+  }
+
+  function quickAddVideoPretemporada(pretemporadaNum, data) {
+    const nv = {
+      id: uid('v'), jugadores: [], clips: [], etiquetas: [],
+      categoria: 'pretemporada', pretemporadaNum, titulo: data.titulo,
+      url: data.url || '', archivoKey: data.archivoKey || undefined, archivoNombre: data.archivoNombre || undefined,
+    };
+    setVideos(v => ({ ...v, items: [...v.items, nv] }));
+    pushActivity('Añadió vídeo', data.titulo);
+    toast.success('Guardado');
+  }
 
   function videoFormFields() {
+    const orden = tabView === 'liga'
+      ? [{ name: 'jornada', label: 'Jornada', type: 'select', required: true, options: JORNADAS_LIGA.map(j => ({ value: String(j), label: 'Jornada ' + j })) }]
+      : [{ name: 'pretemporadaNum', label: 'Nº de partido de pretemporada', type: 'number', required: true, placeholder: 'Ej. 1' }];
     return [
       { name: 'titulo', label: 'Título', required: true },
-      { name: 'url', label: 'Enlace (YouTube, Vimeo o Drive)', required: true, placeholder: 'https://…' },
+      ...orden,
       { name: 'descripcion', label: 'Descripción', type: 'textarea' },
       { name: 'fecha', label: 'Fecha', type: 'date' },
       { name: 'etiquetas', label: 'Etiquetas (separadas por comas)' },
@@ -2534,11 +3321,18 @@ function VideotecaScreen() {
 
   function saveVideo(values) {
     const etiquetas = String(values.etiquetas || '').split(',').map(s => s.trim()).filter(Boolean);
+    const patch = {
+      ...values,
+      etiquetas,
+      categoria: tabView,
+      jornada: tabView === 'liga' && values.jornada ? Number(values.jornada) : undefined,
+      pretemporadaNum: tabView === 'pretemporada' && values.pretemporadaNum ? Number(values.pretemporadaNum) : undefined,
+    };
     if (editing && editing.id) {
-      setVideos(v => ({ ...v, items: v.items.map(x => x.id === editing.id ? { ...x, ...values, etiquetas } : x) }));
+      setVideos(v => ({ ...v, items: v.items.map(x => x.id === editing.id ? { ...x, ...patch } : x) }));
       pushActivity('Editó vídeo', values.titulo);
     } else {
-      const nv = { id: uid('v'), jugadores: [], clips: [], ...values, etiquetas };
+      const nv = { id: uid('v'), jugadores: [], clips: [], ...patch };
       setVideos(v => ({ ...v, items: [...v.items, nv] }));
       pushActivity('Añadió vídeo', values.titulo);
     }
@@ -2549,7 +3343,8 @@ function VideotecaScreen() {
   async function removeVideo(v) {
     const ok = await confirm({ title: 'Eliminar vídeo', message: '¿Eliminar "' + v.titulo + '"?', danger: true, confirmLabel: 'Eliminar' });
     if (!ok) return;
-    setVideos(s => ({ ...s, items: s.items.filter(x => x.id !== v.id), playlists: s.playlists.map(pl => ({ ...pl, videoIds: pl.videoIds.filter(id => id !== v.id) })) }));
+    if (v.archivoKey) storageDelete(v.archivoKey).catch(() => {});
+    setVideos(s => ({ ...s, items: s.items.filter(x => x.id !== v.id) }));
     toast.success('Eliminado');
     setDetail(null);
   }
@@ -2560,23 +3355,33 @@ function VideotecaScreen() {
   }
 
   return (
-    <div className="p-4 md:p-6 max-w-6xl mx-auto space-y-5">
+    <div className={'p-4 md:p-6 mx-auto space-y-5 ' + (tabView === 'videoanalisis' ? 'max-w-7xl' : 'max-w-6xl')}>
       <div className="flex flex-wrap items-center justify-between gap-3">
         <h1 className="font-display text-2xl font-bold">Videoteca</h1>
-        {canEdit && tabView === 'videos' && <button className="btn btn-primary" onClick={() => setEditing(null)}><Icon name="plus" size={16} />Añadir vídeo</button>}
+        {canEdit && esCategoriaTab && <button className="btn btn-primary" onClick={() => setEditing(null)}><Icon name="plus" size={16} />Añadir vídeo</button>}
       </div>
-      <div className="flex gap-1 surface-2 rounded-lg p-1 w-fit">
-        <button onClick={() => setTabView('videos')} className="px-3 py-1.5 rounded-lg text-sm font-medium" style={{ background: tabView === 'videos' ? 'var(--club-red)' : 'transparent', color: tabView === 'videos' ? '#fff' : 'var(--text)' }}>Vídeos</button>
-        <button onClick={() => setTabView('playlists')} className="px-3 py-1.5 rounded-lg text-sm font-medium" style={{ background: tabView === 'playlists' ? 'var(--club-red)' : 'transparent', color: tabView === 'playlists' ? '#fff' : 'var(--text)' }}>Listas de reproducción</button>
+      <div className="flex gap-1 surface-2 rounded-lg p-1 w-fit flex-wrap">
+        <button onClick={() => setTabView('pretemporada')} className="px-3 py-1.5 rounded-lg text-sm font-medium" style={{ background: tabView === 'pretemporada' ? 'var(--club-red)' : 'transparent', color: tabView === 'pretemporada' ? '#fff' : 'var(--text)' }}>Pretemporada</button>
+        <button onClick={() => setTabView('liga')} className="px-3 py-1.5 rounded-lg text-sm font-medium" style={{ background: tabView === 'liga' ? 'var(--club-red)' : 'transparent', color: tabView === 'liga' ? '#fff' : 'var(--text)' }}>Liga</button>
+        <button onClick={() => setTabView('videoanalisis')} className="px-3 py-1.5 rounded-lg text-sm font-medium" style={{ background: tabView === 'videoanalisis' ? 'var(--club-red)' : 'transparent', color: tabView === 'videoanalisis' ? '#fff' : 'var(--text)' }}>Videoanálisis</button>
       </div>
 
-      {tabView === 'videos' ? (
-        <React.Fragment>
+      <div style={{ display: tabView === 'liga' ? 'block' : 'none' }} className="space-y-5">
           <div className="flex flex-wrap gap-3">
             <div className="w-full sm:w-56"><SearchInput value={query} onChange={setQuery} placeholder="Buscar vídeo…" /></div>
-            <select className="field-input w-auto" value={filtroMatch} onChange={e => setFiltroMatch(e.target.value)}>
-              <option value="">Todos los partidos</option>
-              {matches.map(m => <option key={m.id} value={m.id}>{fmtFecha(m.fecha)} vs {(teams.find(t => t.id === m.rivalId) || {}).nombre}</option>)}
+            <select className="field-input w-auto" defaultValue="" onChange={e => { irAJornada(e.target.value); e.target.value = ''; }}>
+              <option value="">Ir a jornada…</option>
+              {JORNADAS_LIGA.map(n => {
+                const partido = partidoDeJornada(n);
+                const etiqueta = partido
+                  ? 'Jornada ' + n + ' · ' + (partido.condicion === 'local' ? 'vs ' : '@ ') + partido.rival + ' · ' + fmtFecha(partido.fecha)
+                  : 'Jornada ' + n;
+                return <option key={n} value={n}>{etiqueta}</option>;
+              })}
+            </select>
+            <select className="field-input w-auto" value={ordenDir} onChange={e => setOrdenDir(e.target.value)}>
+              <option value="asc">Jornada 1 → 42</option>
+              <option value="desc">Jornada 42 → 1</option>
             </select>
             <select className="field-input w-auto" value={filtroJugador} onChange={e => setFiltroJugador(e.target.value)}>
               <option value="">Todos los jugadores</option>
@@ -2587,14 +3392,91 @@ function VideotecaScreen() {
               {allTags.map(t => <option key={t} value={t}>{t}</option>)}
             </select>
           </div>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            {filtered.map(v => <VideoCard key={v.id} video={v} rival={teams.find(t => t.id === v.rivalId)} onClick={() => setDetail(v)} />)}
-            {!filtered.length && <EmptyState icon="video" text="No hay vídeos que coincidan con los filtros." />}
+          <div className="space-y-2">
+            {jornadasOrdenadas.map(n => {
+              const videosJornada = itemsLiga.filter(v => Number(v.jornada) === n);
+              if (hayFiltroActivo && !videosJornada.length) return null;
+              const partido = partidoDeJornada(n);
+              const rivalPartido = partido && teams.find(t => t.nombre === partido.rival);
+              const resultado = partido && resultadoSporting(partido);
+              const badgeStyle = resultado === 'victoria' ? { color: 'var(--ok)', background: 'var(--ok-bg)' }
+                : resultado === 'derrota' ? { color: 'var(--danger)', background: 'var(--danger-bg)' }
+                : resultado === 'empate' ? { color: 'var(--info)', background: 'var(--info-bg)' } : null;
+              const titulo = (
+                <span className="flex items-center gap-2 flex-wrap">
+                  <span>Jornada {n}</span>
+                  {partido && (
+                    <React.Fragment>
+                      <TeamShield team={rivalPartido} size={20} />
+                      <span className="text-sm font-normal text-muted">
+                        {(partido.condicion === 'local' ? 'vs ' : '@ ') + partido.rival}
+                        {partido.derbi && <span className="badge ml-1" style={{ background: 'var(--club-red)', color: '#fff' }}>Derbi</span>}
+                      </span>
+                      <span className="text-xs font-normal text-muted">{fmtFecha(partido.fecha)}</span>
+                      {partido.resultado ? (
+                        <span className="badge tabular text-xs" style={badgeStyle}>{partido.resultado.local + ' - ' + partido.resultado.visitante}</span>
+                      ) : (
+                        <span className="badge text-xs" style={{ background: 'var(--surface-2)', color: 'var(--text-muted)' }}>Por jugar</span>
+                      )}
+                    </React.Fragment>
+                  )}
+                </span>
+              );
+              return (
+                <div key={n} ref={el => { sectionRefs.current[n] = el; }}>
+                  <VideoAccordionSection
+                    titulo={titulo} videos={videosJornada} isOpen={openJornada === n}
+                    onToggle={() => setOpenJornada(o => o === n ? null : n)}
+                    canEdit={canEdit} onOpenVideo={setDetail}
+                    onQuickAdd={(data) => quickAddVideoJornada(n, data)}
+                    rivalOf={v => teams.find(t => t.id === v.rivalId)} />
+                </div>
+              );
+            })}
           </div>
-        </React.Fragment>
-      ) : (
-        <PlaylistsPanel videos={videos} setVideos={setVideos} canEdit={canEdit} onOpenVideo={setDetail} />
-      )}
+      </div>
+
+      <div style={{ display: tabView === 'pretemporada' ? 'block' : 'none' }} className="space-y-5">
+          <div className="flex flex-wrap gap-3">
+            <div className="w-full sm:w-56"><SearchInput value={query} onChange={setQuery} placeholder="Buscar vídeo…" /></div>
+            <select className="field-input w-auto" defaultValue="" onChange={e => { irAPretemporada(e.target.value); e.target.value = ''; }}>
+              <option value="">Ir a partido…</option>
+              {seccionesPretemporada.map(n => <option key={n} value={n}>Pretemporada {n}</option>)}
+            </select>
+            <select className="field-input w-auto" value={ordenDir} onChange={e => setOrdenDir(e.target.value)}>
+              <option value="asc">Pretemporada 1 → …</option>
+              <option value="desc">… → Pretemporada 1</option>
+            </select>
+            <select className="field-input w-auto" value={filtroJugador} onChange={e => setFiltroJugador(e.target.value)}>
+              <option value="">Todos los jugadores</option>
+              {players.map(p => <option key={p.id} value={p.id}>{p.nombre}</option>)}
+            </select>
+            <select className="field-input w-auto" value={filtroTag} onChange={e => setFiltroTag(e.target.value)}>
+              <option value="">Todas las etiquetas</option>
+              {allTags.map(t => <option key={t} value={t}>{t}</option>)}
+            </select>
+          </div>
+          <div className="space-y-2">
+            {pretemporadaOrdenada.map(n => {
+              const videosPretemporada = itemsPretemporada.filter(v => Number(v.pretemporadaNum) === n);
+              if (hayFiltroActivo && !videosPretemporada.length) return null;
+              return (
+                <div key={n} ref={el => { sectionRefsPre.current[n] = el; }}>
+                  <VideoAccordionSection
+                    titulo={'Pretemporada ' + n} videos={videosPretemporada} isOpen={openPretemporada === n}
+                    onToggle={() => setOpenPretemporada(o => o === n ? null : n)}
+                    canEdit={canEdit} onOpenVideo={setDetail}
+                    onQuickAdd={(data) => quickAddVideoPretemporada(n, data)}
+                    rivalOf={v => teams.find(t => t.id === v.rivalId)} />
+                </div>
+              );
+            })}
+          </div>
+      </div>
+
+      <div style={{ display: tabView === 'videoanalisis' ? 'block' : 'none' }}>
+        <VideoAnalisisScreen />
+      </div>
 
       {detail && (
         <VideoDetailModal video={detail} rival={teams.find(t => t.id === detail.rivalId)} match={matches.find(m => m.id === detail.matchId)}
@@ -2605,8 +3487,10 @@ function VideotecaScreen() {
 
       {editing !== undefined && (
         <EntityFormModal title={editing ? 'Editar vídeo' : 'Nuevo vídeo'} fields={videoFormFields()}
-          initial={editing ? { ...editing, etiquetas: (editing.etiquetas || []).join(', ') } : {}}
-          onSubmit={saveVideo} onClose={() => setEditing(undefined)} wide />
+          initial={editing ? { ...editing, etiquetas: (editing.etiquetas || []).join(', '), jornada: editing.jornada != null ? String(editing.jornada) : '', pretemporadaNum: editing.pretemporadaNum != null ? String(editing.pretemporadaNum) : '' } : {}}
+          onSubmit={saveVideo} onClose={() => setEditing(undefined)}
+          renderExtra={(values, set) => <VideoSourceField values={values} set={set} />}
+          extraValidate={extraValidateVideo} wide />
       )}
     </div>
   );
@@ -2617,6 +3501,13 @@ function VideoDetailModal({ video, rival, match, players, canEdit, canDelete, on
   const toast = useToast();
   const [nuevoClip, setNuevoClip] = useState({ inicio: '', fin: '', categoria: 'gol', nota: '' });
   const jugadoresVinculados = (video.jugadores || []).map(id => players.find(p => p.id === id)).filter(Boolean);
+  const [archivoUrl, setArchivoUrl] = useState(null);
+  useEffect(() => {
+    if (!video.archivoKey) { setArchivoUrl(null); return; }
+    let cancelado = false;
+    storageGet(video.archivoKey).then(v => { if (!cancelado) setArchivoUrl(v); }).catch(() => { if (!cancelado) setArchivoUrl(null); });
+    return () => { cancelado = true; };
+  }, [video.archivoKey]);
 
   function addClip() {
     if (!nuevoClip.inicio) { toast.error('Indica el minuto de inicio (mm:ss)'); return; }
@@ -2637,9 +3528,16 @@ function VideoDetailModal({ video, rival, match, players, canEdit, canDelete, on
           {rival && <span>{rival.nombre}</span>}
           {video.fecha && <span>· {fmtFecha(video.fecha)}</span>}
           {match && <span>· J{match.jornada}</span>}
+          {video.categoria === 'liga' && video.jornada != null && video.jornada !== '' && <span>· Jornada {video.jornada}</span>}
+          {video.categoria === 'pretemporada' && video.pretemporadaNum != null && video.pretemporadaNum !== '' && <span>· Pretemporada {video.pretemporadaNum}</span>}
         </div>
         {video.descripcion && <p className="text-sm">{video.descripcion}</p>}
-        <a href={video.url} target="_blank" rel="noopener" className="btn btn-primary w-fit"><Icon name="externalLink" size={15} />Abrir vídeo original</a>
+        {video.archivoKey ? (
+          archivoUrl ? <video src={archivoUrl} controls className="w-full rounded-lg" style={{ maxHeight: 360, background: '#000' }} />
+            : <p className="text-sm text-muted">Cargando vídeo…</p>
+        ) : (
+          <a href={video.url} target="_blank" rel="noopener" className="btn btn-primary w-fit"><Icon name="externalLink" size={15} />Abrir vídeo original</a>
+        )}
 
         <div>
           <div className="field-label mb-2">Clips</div>
@@ -2649,7 +3547,7 @@ function VideoDetailModal({ video, rival, match, players, canEdit, canDelete, on
                 <span className="badge" style={{ background: 'var(--info-bg)', color: 'var(--info)' }}>{(CATEGORIAS_CLIP.find(x => x.key === c.categoria) || {}).label}</span>
                 <span className="tabular">{mmss(c.inicio)}{c.fin ? ' – ' + mmss(c.fin) : ''}</span>
                 <span className="flex-1 truncate text-muted">{c.nota}</span>
-                <a href={buildTimestampUrl(video.url, c.inicio)} target="_blank" rel="noopener" className="icon-btn" title="Ver clip"><Icon name="play" size={14} /></a>
+                <a href={video.url ? buildTimestampUrl(video.url, c.inicio) : archivoUrl} target="_blank" rel="noopener" className="icon-btn" title="Ver clip"><Icon name="play" size={14} /></a>
                 {canEdit && <button className="icon-btn" onClick={() => removeClip(c.id)}><Icon name="x" size={14} /></button>}
               </div>
             ))}
@@ -2698,59 +3596,680 @@ function VideoDetailModal({ video, rival, match, players, canEdit, canDelete, on
   );
 }
 
-function PlaylistsPanel({ videos, setVideos, canEdit, onOpenVideo }) {
-  const toast = useToast();
-  const [nombre, setNombre] = useState('');
-  const [openId, setOpenId] = useState(null);
-  const playlists = videos.playlists || [];
+function YoutubeAnalisisPlayer({ videoId, playerRef, onPlayingChange }) {
+  const containerRef = useRef(null);
+  useEffect(() => {
+    let destroyed = false;
+    let player = null;
+    loadYouTubeApi().then(YT => {
+      if (destroyed || !containerRef.current) return;
+      player = new YT.Player(containerRef.current, {
+        videoId,
+        playerVars: { rel: 0, modestbranding: 1 },
+        events: {
+          onReady: (e) => { playerRef.current = e.target; },
+          onStateChange: (e) => { onPlayingChange(e.data === 1); },
+        },
+      });
+    });
+    return () => {
+      destroyed = true;
+      playerRef.current = null;
+      if (player && player.destroy) { try { player.destroy(); } catch (e) {} }
+    };
+    // key={videoId} en el punto de uso fuerza un remonte completo (contenedor nuevo) en cada
+    // cambio de vídeo, así que aquí basta con montar/desmontar una única vez.
+    // eslint-disable-next-line
+  }, []);
 
-  function crearPlaylist() {
-    if (!nombre.trim()) { toast.error('Ponle un nombre a la lista'); return; }
-    setVideos(v => ({ ...v, playlists: [...v.playlists, { id: uid('pl'), nombre: nombre.trim(), videoIds: [] }] }));
-    setNombre('');
+  return (
+    <div className="aspect-video w-full rounded-lg overflow-hidden" style={{ background: '#000' }}>
+      <div ref={containerRef} className="w-full h-full" />
+    </div>
+  );
+}
+
+// Reproductor para vídeos cargados desde el ordenador (archivo local). Expone la misma
+// interfaz (getCurrentTime/seekTo/playVideo) que YoutubeAnalisisPlayer para que el resto
+// de la pantalla de videoanálisis no tenga que distinguir el origen del vídeo.
+function LocalAnalisisPlayer({ src, playerRef, onPlayingChange }) {
+  const videoRef = useRef(null);
+
+  useEffect(() => {
+    const el = videoRef.current;
+    if (!el) return;
+    playerRef.current = {
+      getCurrentTime: () => el.currentTime,
+      seekTo: (seg) => { el.currentTime = seg; el.play().catch(() => {}); },
+      playVideo: () => { el.play().catch(() => {}); },
+    };
+    return () => { playerRef.current = null; };
+  }, [src]);
+
+  return (
+    <div className="aspect-video w-full rounded-lg overflow-hidden" style={{ background: '#000' }}>
+      <video ref={videoRef} src={src} controls className="w-full h-full"
+        onPlay={() => onPlayingChange(true)} onPause={() => onPlayingChange(false)} />
+    </div>
+  );
+}
+
+function AnalisisPitch({ activo, onPick, pendingPoint, onBlockedClick }) {
+  const svgRef = useRef(null);
+  function handleClick(e) {
+    if (!activo) { if (onBlockedClick) onBlockedClick(); return; }
+    const p = getSvgPoint(svgRef.current, e.clientX, e.clientY);
+    const x = clamp(p.x, 0, 100);
+    const y = clamp((p.y / 64) * 100, 0, 100);
+    onPick({ x, y });
   }
-  function eliminarPlaylist(id) { setVideos(v => ({ ...v, playlists: v.playlists.filter(p => p.id !== id) })); }
-  function toggleVideoInPlaylist(plId, videoId) {
-    setVideos(v => ({
-      ...v, playlists: v.playlists.map(p => p.id !== plId ? p : {
-        ...p, videoIds: p.videoIds.includes(videoId) ? p.videoIds.filter(x => x !== videoId) : [...p.videoIds, videoId],
-      }),
-    }));
+  return (
+    <div className="rounded-lg overflow-hidden" style={{ opacity: activo ? 1 : 0.5, cursor: activo ? 'crosshair' : 'not-allowed', transition: 'opacity .15s' }}>
+      <svg ref={svgRef} viewBox="0 0 100 64" className="w-full h-auto block" onClick={handleClick} style={{ background: 'var(--pitch)' }}>
+        <g stroke="var(--pitch-line)" strokeWidth="0.4" fill="none">
+          <rect x="0.4" y="0.4" width="99.2" height="63.2" />
+          <line x1="50" y1="0.4" x2="50" y2="63.6" />
+          <circle cx="50" cy="32" r="8.5" />
+          <circle cx="50" cy="32" r="0.4" fill="var(--pitch-line)" />
+          <rect x="0.4" y="14" width="15" height="36" />
+          <rect x="84.6" y="14" width="15" height="36" />
+          <rect x="0.4" y="24" width="5" height="16" />
+          <rect x="95" y="24" width="5" height="16" />
+        </g>
+        {pendingPoint && <circle cx={pendingPoint.x} cy={(pendingPoint.y / 100) * 64} r="1.8" fill="#fbbf24" stroke="#111827" strokeWidth="0.3" />}
+      </svg>
+    </div>
+  );
+}
+
+function MiniCampo({ x, y }) {
+  if (x == null || y == null) return <span className="text-muted text-xs">—</span>;
+  return (
+    <svg viewBox="0 0 100 64" width="40" height="26" style={{ background: 'var(--pitch)', borderRadius: 4 }}>
+      <rect x="0.4" y="0.4" width="99.2" height="63.2" fill="none" stroke="var(--pitch-line)" strokeWidth="1" />
+      <circle cx={x} cy={(y / 100) * 64} r="4" fill="#fbbf24" stroke="#111827" strokeWidth="0.6" />
+    </svg>
+  );
+}
+
+// Pequeño control +/- para alargar o acortar a mano el inicio o el fin de un corte.
+function ClipStepper({ label, value, onDec, onInc }) {
+  return (
+    <div className="flex items-center gap-1">
+      {label && <span className="text-muted text-xs w-9">{label}</span>}
+      <button type="button" className="icon-btn" style={{ width: '1.4rem', height: '1.4rem' }} onClick={onDec}>−</button>
+      <span className="tabular text-sm w-11 text-center">{mmss(value)}</span>
+      <button type="button" className="icon-btn" style={{ width: '1.4rem', height: '1.4rem' }} onClick={onInc}>+</button>
+    </div>
+  );
+}
+
+function BotonAccion({ label, activo, color, onClick, disabled }) {
+  return (
+    <button type="button" disabled={disabled} onClick={onClick}
+      className="rounded-lg py-2.5 text-sm font-bold tracking-wide border-2 transition-colors"
+      style={{ background: activo ? color : 'transparent', color: activo ? '#fff' : color, borderColor: color, opacity: disabled ? 0.5 : 1, cursor: disabled ? 'not-allowed' : 'pointer' }}>
+      {label}
+    </button>
+  );
+}
+
+function BotoneraRegistro({ parte, setParte, tipoJugada, onTipoJugada, signo, onSigno, abp, onAbp, individual, onIndividual, crono, disabled }) {
+  return (
+    <div className="card p-3 space-y-3">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex gap-1 surface-2 rounded-lg p-1">
+          <button type="button" onClick={() => setParte('1')} className="px-3 py-1.5 rounded-lg text-sm font-medium" style={{ background: parte === '1' ? 'var(--club-red)' : 'transparent', color: parte === '1' ? '#fff' : 'var(--text)' }}>1ª parte</button>
+          <button type="button" onClick={() => setParte('2')} className="px-3 py-1.5 rounded-lg text-sm font-medium" style={{ background: parte === '2' ? 'var(--club-red)' : 'transparent', color: parte === '2' ? '#fff' : 'var(--text)' }}>2ª parte</button>
+        </div>
+        {crono != null && <span className="font-display text-xl font-bold tabular">{mmss(crono)}</span>}
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        <BotonAccion label="GOL" activo={tipoJugada === 'gol'} color="#f97316" onClick={() => onTipoJugada('gol')} disabled={disabled} />
+        <BotonAccion label="OCASIÓN" activo={tipoJugada === 'ocasion'} color="#eab308" onClick={() => onTipoJugada('ocasion')} disabled={disabled} />
+        <BotonAccion label="A FAVOR" activo={signo === 'favor'} color="#16a34a" onClick={() => onSigno('favor')} disabled={disabled} />
+        <BotonAccion label="EN CONTRA" activo={signo === 'contra'} color="#dc2626" onClick={() => onSigno('contra')} disabled={disabled} />
+        <BotonAccion label="ABP OF" activo={abp === 'ofensiva'} color="#7c3aed" onClick={() => onAbp('ofensiva')} disabled={disabled} />
+        <BotonAccion label="ABP DEF" activo={abp === 'defensiva'} color="#7f1d1d" onClick={() => onAbp('defensiva')} disabled={disabled} />
+        <button type="button" disabled={disabled} onClick={onIndividual}
+          className="col-span-2 rounded-lg py-2.5 text-sm font-bold tracking-wide border-2 transition-colors"
+          style={{ background: individual ? '#0ea5e9' : 'transparent', color: individual ? '#fff' : '#0ea5e9', borderColor: '#0ea5e9', opacity: disabled ? 0.5 : 1, cursor: disabled ? 'not-allowed' : 'pointer' }}>
+          INDIVIDUAL
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function SeleccionarJugadorModal({ players, onSelect, onClose }) {
+  const [q, setQ] = useState('');
+  const filtered = players.filter(p => !q || p.nombre.toLowerCase().includes(q.toLowerCase()) || String(p.dorsal || '').includes(q));
+  return (
+    <Modal title="Selecciona el jugador implicado" onClose={onClose}>
+      <div className="space-y-3">
+        <SearchInput value={q} onChange={setQ} placeholder="Buscar por nombre o dorsal…" />
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 max-h-72 overflow-y-auto">
+          {filtered.map(p => (
+            <button key={p.id} className="card p-2 flex items-center gap-2 text-left hover:shadow-md" onClick={() => onSelect(p.id)}>
+              <span className="badge" style={{ background: 'var(--surface-2)' }}>{p.dorsal != null ? p.dorsal : '-'}</span>
+              <span className="text-sm truncate">{p.nombre}</span>
+            </button>
+          ))}
+          {!filtered.length && <p className="text-sm text-muted col-span-full">Sin resultados.</p>}
+        </div>
+        <button className="btn btn-secondary w-full" onClick={() => onSelect(null)}>Guardar sin asignar jugador</button>
+      </div>
+    </Modal>
+  );
+}
+
+function EventoEditModal({ evento, players, onSave, onClose }) {
+  const toast = useToast();
+  const [parte, setParte] = useState(evento.parte);
+  const [tipoJugada, setTipoJugada] = useState(evento.tipo_jugada);
+  const [signo, setSigno] = useState(evento.signo);
+  const [abp, setAbp] = useState(evento.abp);
+  const [individual, setIndividual] = useState(evento.individual);
+  const [jugadorId, setJugadorId] = useState(evento.jugador_id);
+  const [inicio, setInicio] = useState(evento.inicio);
+  const [fin, setFin] = useState(evento.fin);
+  const [posicion, setPosicion] = useState(evento.posicion_campo);
+
+  function toggleAbp(v) { setAbp(cur => cur === v ? null : v); setIndividual(false); }
+  function toggleIndividual() { setIndividual(cur => !cur); setAbp(null); }
+
+  function decInicio() { setInicio(v => clamp(v - 1, 0, fin - 1)); }
+  function incInicio() { setInicio(v => clamp(v + 1, 0, fin - 1)); }
+  function decFin() { setFin(v => Math.max(inicio + 1, v - 1)); }
+  function incFin() { setFin(v => v + 1); }
+
+  function guardar() {
+    const completo = (tipoJugada && signo) || abp || individual;
+    if (!completo) { toast.error('Selecciona GOL/OCASIÓN + signo, o bien ABP OF/DEF/INDIVIDUAL'); return; }
+    onSave({
+      parte, tipo_jugada: tipoJugada, signo, abp, individual,
+      jugador_id: jugadorId || null, inicio, fin, posicion_campo: posicion,
+    });
   }
 
   return (
+    <Modal title="Editar evento" onClose={onClose} wide>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div className="space-y-3">
+          <div>
+            <div className="field-label mb-1">Corte (alarga o acorta con − / +)</div>
+            <div className="flex flex-col gap-1.5">
+              <ClipStepper label="Inicio" value={inicio} onDec={decInicio} onInc={incInicio} />
+              <ClipStepper label="Fin" value={fin} onDec={decFin} onInc={incFin} />
+            </div>
+          </div>
+          <BotoneraRegistro parte={parte} setParte={setParte}
+            tipoJugada={tipoJugada} onTipoJugada={v => setTipoJugada(cur => cur === v ? null : v)}
+            signo={signo} onSigno={v => setSigno(cur => cur === v ? null : v)}
+            abp={abp} onAbp={toggleAbp} individual={individual} onIndividual={toggleIndividual} />
+          <div>
+            <div className="field-label mb-1">Jugador</div>
+            <select className="field-input" value={jugadorId || ''} onChange={e => setJugadorId(e.target.value || null)}>
+              <option value="">Sin asignar</option>
+              {players.map(p => <option key={p.id} value={p.id}>{p.dorsal} · {p.nombre}</option>)}
+            </select>
+          </div>
+        </div>
+        <div>
+          <div className="field-label mb-1">Posición en el campo (haz click para moverla)</div>
+          <AnalisisPitch activo onPick={setPosicion} pendingPoint={posicion} />
+        </div>
+      </div>
+      <div className="flex justify-end gap-2 pt-4 mt-4 border-t" style={{ borderColor: 'var(--border)' }}>
+        <button className="btn btn-secondary" onClick={onClose}>Cancelar</button>
+        <button className="btn btn-primary" onClick={guardar}>Guardar</button>
+      </div>
+    </Modal>
+  );
+}
+
+function TablaEventosAnalisis({ eventos, players, canEdit, canDelete, onSeek, onEdit, onDelete, onAjustar }) {
+  return (
+    <div className="card overflow-x-auto">
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="text-left text-muted border-b" style={{ borderColor: 'var(--border)' }}>
+            <th className="px-3 py-2">#</th>
+            <th className="px-3 py-2">Parte</th>
+            <th className="px-3 py-2">Corte</th>
+            <th className="px-3 py-2">Dur.</th>
+            <th className="px-3 py-2">Tipo</th>
+            <th className="px-3 py-2">Signo</th>
+            <th className="px-3 py-2">ABP</th>
+            <th className="px-3 py-2">Individual</th>
+            <th className="px-3 py-2">Jugador</th>
+            <th className="px-3 py-2">Campo</th>
+            <th className="px-3 py-2"></th>
+          </tr>
+        </thead>
+        <tbody>
+          {eventos.map((e, i) => {
+            const jugador = players.find(p => p.id === e.jugador_id);
+            return (
+              <tr key={e.id} className="border-b cursor-pointer" style={{ borderColor: 'var(--border)' }} onClick={() => onSeek(e.inicio)}>
+                <td className="px-3 py-2 tabular">{i + 1}</td>
+                <td className="px-3 py-2">{e.parte}ª</td>
+                <td className="px-3 py-2" onClick={ev => ev.stopPropagation()}>
+                  {canEdit ? (
+                    <div className="flex flex-col gap-1">
+                      <ClipStepper label="Inicio" value={e.inicio} onDec={() => onAjustar(e.id, 'inicio', -1)} onInc={() => onAjustar(e.id, 'inicio', 1)} />
+                      <ClipStepper label="Fin" value={e.fin} onDec={() => onAjustar(e.id, 'fin', -1)} onInc={() => onAjustar(e.id, 'fin', 1)} />
+                    </div>
+                  ) : (
+                    <span className="tabular">{mmss(e.inicio)} – {mmss(e.fin)}</span>
+                  )}
+                </td>
+                <td className="px-3 py-2 tabular">{Math.round(e.fin - e.inicio)}s</td>
+                <td className="px-3 py-2">{labelTipoJugada(e.tipo_jugada)}</td>
+                <td className="px-3 py-2">{labelSigno(e.signo)}</td>
+                <td className="px-3 py-2">{e.abp ? (e.abp === 'ofensiva' ? 'Of.' : 'Def.') : '—'}</td>
+                <td className="px-3 py-2">{e.individual ? 'Sí' : 'No'}</td>
+                <td className="px-3 py-2 truncate max-w-[140px]">{jugador ? jugador.nombre : '—'}</td>
+                <td className="px-3 py-2"><MiniCampo x={e.posicion_campo && e.posicion_campo.x} y={e.posicion_campo && e.posicion_campo.y} /></td>
+                <td className="px-3 py-2" onClick={ev => ev.stopPropagation()}>
+                  <div className="flex items-center gap-1 justify-end">
+                    {canEdit && <button className="icon-btn" onClick={() => onEdit(e)}><Icon name="edit" size={14} /></button>}
+                    {canDelete && <button className="icon-btn" onClick={() => onDelete(e.id)}><Icon name="trash" size={14} /></button>}
+                  </div>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      {!eventos.length && <EmptyState icon="tag" text="Todavía no hay eventos registrados para este vídeo." />}
+    </div>
+  );
+}
+
+function VideoAnalisisScreen() {
+  const { videos, setVideos, players, canDo, pushActivity } = useAppData();
+  const toast = useToast();
+  const confirm = useConfirm();
+  const canEdit = canDo('videoteca', 'editar');
+  const canDelete = canDo('videoteca', 'eliminar');
+  // El reproductor de YouTube necesita un origen http(s) real para poder comunicarse con la
+  // página (postMessage). Abriendo el archivo con doble clic (file://) el origen es nulo y
+  // YouTube rechaza la carga (Error 153), así que avisamos en vez de dejar que falle en silencio.
+  const bloqueadoPorFileProtocol = window.location.protocol === 'file:';
+
+  const [urlInput, setUrlInput] = useState('');
+  const [videoId, setVideoId] = useState(null);
+  const [modoFuente, setModoFuente] = useState('url');
+  const [localVideoUrl, setLocalVideoUrl] = useState(null);
+  const [localFileName, setLocalFileName] = useState('');
+  const fileInputRef = useRef(null);
+  const playerRef = useRef(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+
+  // Libera la URL del objeto Blob anterior cada vez que se carga un vídeo nuevo o se
+  // desmonta la pantalla, para no acumular memoria.
+  useEffect(() => {
+    return () => { if (localVideoUrl) URL.revokeObjectURL(localVideoUrl); };
+  }, [localVideoUrl]);
+
+  const [parte, setParte] = useState('1');
+  const [tipoJugada, setTipoJugada] = useState(null);
+  const [signo, setSigno] = useState(null);
+  const [abp, setAbp] = useState(null);
+  const [individual, setIndividual] = useState(false);
+  const [pendingPoint, setPendingPoint] = useState(null);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [editingEvento, setEditingEvento] = useState(null);
+
+  useEffect(() => {
+    if (!isPlaying) return;
+    const id = setInterval(() => {
+      if (playerRef.current && playerRef.current.getCurrentTime) {
+        setCurrentTime(playerRef.current.getCurrentTime());
+      }
+    }, 250);
+    return () => clearInterval(id);
+  }, [isPlaying]);
+
+  const eventos = (videoId && videos.analisis && videos.analisis[videoId]) || [];
+
+  function setEventos(updater) {
+    setVideos(v => {
+      const cur = (v.analisis && v.analisis[videoId]) || [];
+      const next = typeof updater === 'function' ? updater(cur) : updater;
+      return { ...v, analisis: { ...(v.analisis || {}), [videoId]: next } };
+    });
+  }
+
+  // Vídeo de la pestaña Jornadas (o Pretemporada) al que se vinculan los cortes de este
+  // vídeo de videoanálisis: cada evento que se registre, ajuste o borre aquí se refleja
+  // como un clip en ese vídeo para que aparezca también en su ficha.
+  const itemsVinculables = (videos.items || []).slice().sort((a, b) => {
+    if (a.categoria !== b.categoria) return a.categoria === 'liga' ? -1 : 1;
+    return (Number(a.jornada || a.pretemporadaNum) || 0) - (Number(b.jornada || b.pretemporadaNum) || 0);
+  });
+  // Si el vídeo enlazado se ha borrado mientras tanto, se trata como si no hubiera
+  // vinculación (en vez de dejar el enlace huérfano bloqueado para siempre).
+  const linkCrudo = videoId && videos.analisisLink && videos.analisisLink[videoId];
+  const vinculadoId = (linkCrudo && itemsVinculables.some(it => it.id === linkCrudo)) ? linkCrudo : '';
+
+  function vincularVideo(id) {
+    setVideos(v => {
+      const next = { ...(v.analisisLink || {}) };
+      if (id) next[videoId] = id; else delete next[videoId];
+      return { ...v, analisisLink: next };
+    });
+  }
+
+  // Si el enlace de YouTube cargado coincide con el de un vídeo ya registrado en Jornadas
+  // o Pretemporada, se vincula solo automáticamente (sin pisar una vinculación manual ni
+  // volver a intentarlo si ya hay una vinculación válida).
+  useEffect(() => {
+    if (!videoId || videoId.startsWith('local:') || vinculadoId) return;
+    const coincidencia = (videos.items || []).find(it => it.url && extractYoutubeId(it.url) === videoId);
+    if (coincidencia) vincularVideo(coincidencia.id);
+    // eslint-disable-next-line
+  }, [videoId, vinculadoId]);
+
+  function syncClipVinculado(updater) {
+    if (!vinculadoId) return;
+    setVideos(v => ({
+      ...v,
+      items: (v.items || []).map(it => it.id === vinculadoId ? { ...it, clips: updater(it.clips || []) } : it),
+    }));
+  }
+
+  function resetSeleccion() {
+    setTipoJugada(null); setSigno(null); setAbp(null); setIndividual(false); setPendingPoint(null);
+  }
+
+  function cargarVideo(raw) {
+    const id = extractYoutubeId(raw);
+    if (!id) { if (raw.trim()) toast.error('Introduce una URL válida de YouTube'); return; }
+    setLocalVideoUrl(null); setLocalFileName('');
+    setVideoId(id);
+    setCurrentTime(0);
+    setIsPlaying(false);
+    resetSeleccion();
+  }
+
+  function handleUrlChange(v) {
+    setUrlInput(v);
+    const id = extractYoutubeId(v);
+    if (id && id !== videoId) {
+      setLocalVideoUrl(null); setLocalFileName('');
+      setVideoId(id); setCurrentTime(0); setIsPlaying(false); resetSeleccion();
+    }
+  }
+
+  // El vídeo local no se sube a ningún sitio: sólo se reproduce desde el propio ordenador
+  // durante esta sesión, igual que ocurre con un enlace de YouTube que hay que volver a
+  // pegar en cada visita. El identificador de las anotaciones se calcula a partir del
+  // nombre/tamaño/fecha del archivo (no de su contenido) para que, si se vuelve a elegir el
+  // mismo vídeo más adelante, se recuperen los eventos ya registrados.
+  async function cargarVideoLocal(file) {
+    if (!file) return;
+    if (!file.type || !file.type.startsWith('video/')) { toast.error('Selecciona un archivo de vídeo'); return; }
+    const huella = await sha256(file.name + '|' + file.size + '|' + file.lastModified);
+    const id = 'local:' + huella.slice(0, 24);
+    const url = URL.createObjectURL(file);
+    setLocalVideoUrl(url);
+    setLocalFileName(file.name);
+    setUrlInput('');
+    setVideoId(id);
+    setCurrentTime(0);
+    setIsPlaying(false);
+    resetSeleccion();
+  }
+
+  function onElegirArchivoLocal(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = '';
+    if (file) cargarVideoLocal(file);
+  }
+
+  // Carga directamente el vídeo ya guardado en la ficha de una jornada (pestaña Liga),
+  // para poder retomar su videoanálisis sin tener que volver a pegar el enlace o
+  // resubir el archivo. Si es un archivo subido, se recupera de su almacenamiento
+  // persistente (no del blob temporal de sesión que usa "Subir desde el ordenador" aquí).
+  async function cargarVideoDeJornada(item) {
+    resetSeleccion(); setIsPlaying(false); setCurrentTime(0); setPickerOpen(false);
+    if (item.url) {
+      const id = extractYoutubeId(item.url);
+      if (!id) { toast.error('El vídeo de esta jornada no tiene un enlace de YouTube válido.'); return; }
+      setLocalVideoUrl(null); setLocalFileName('');
+      setModoFuente('url'); setUrlInput(item.url);
+      setVideoId(id);
+      setVideos(v => (v.analisisLink && v.analisisLink[id]) === item.id ? v : ({ ...v, analisisLink: { ...(v.analisisLink || {}), [id]: item.id } }));
+      return;
+    }
+    if (item.archivoKey) {
+      try {
+        const dataUrl = await storageGet(item.archivoKey);
+        const id = 'local:jornada-' + item.id;
+        setModoFuente('archivo'); setUrlInput('');
+        setLocalFileName(item.archivoNombre || item.titulo || 'Vídeo de la jornada');
+        setLocalVideoUrl(dataUrl);
+        setVideoId(id);
+        setVideos(v => (v.analisisLink && v.analisisLink[id]) === item.id ? v : ({ ...v, analisisLink: { ...(v.analisisLink || {}), [id]: item.id } }));
+      } catch (e) {
+        toast.error('No se pudo cargar el vídeo de esta jornada.');
+      }
+      return;
+    }
+    toast.error('Este vídeo no tiene enlace ni archivo cargado.');
+  }
+
+  function irAJornadaAnalisis(valor) {
+    const n = Number(valor);
+    if (!n) return;
+    const item = (videos.items || []).find(v => v.categoria === 'liga' && Number(v.jornada) === n);
+    if (!item) { toast.error('No hay vídeo guardado en Jornadas para la Jornada ' + n + '. Añádelo primero en la pestaña Liga.'); return; }
+    cargarVideoDeJornada(item);
+  }
+
+  function elegirModoFuente(m) {
+    if (m === modoFuente) return;
+    setModoFuente(m);
+  }
+
+  // GOL/OCASIÓN + signo es una vía para activar el campo, pero ABP OF/DEF e INDIVIDUAL
+  // también valen por sí solos: no hace falta combinarlos con gol/ocasión.
+  const listoParaCampo = !!((tipoJugada && signo) || abp || individual);
+
+  function toggleTipoJugada(v) { setTipoJugada(cur => cur === v ? null : v); }
+  function toggleSigno(v) { setSigno(cur => cur === v ? null : v); }
+  function toggleAbp(v) { setAbp(cur => cur === v ? null : v); setIndividual(false); }
+  function toggleIndividual() { setIndividual(cur => !cur); setAbp(null); }
+
+  function onPitchPick(point) {
+    if (!canEdit || !listoParaCampo) return;
+    setPendingPoint(point);
+    if (players.length > 0) setPickerOpen(true);
+    else finalizarEvento(point, null);
+  }
+
+  function finalizarEvento(point, jugadorId) {
+    const inicio = Math.max(0, currentTime - CLIP_SEGUNDOS_ANTES);
+    const fin = currentTime + CLIP_SEGUNDOS_DESPUES;
+    const nuevo = {
+      id: uid('va'), parte, inicio, fin, tipo_jugada: tipoJugada, signo, abp,
+      individual, jugador_id: jugadorId, posicion_campo: point, fecha_creacion: Date.now(),
+    };
+    setEventos(cur => [...cur, nuevo]);
+    syncClipVinculado(clips => [...clips, clipDeEvento(nuevo, players)]);
+    const etiqueta = [
+      nuevo.tipo_jugada ? labelTipoJugada(nuevo.tipo_jugada) : null,
+      nuevo.abp ? (nuevo.abp === 'ofensiva' ? 'ABP ofensiva' : 'ABP defensiva') : null,
+      nuevo.individual ? 'Individual' : null,
+    ].filter(Boolean).join(' · ') || 'Evento';
+    pushActivity('Registró evento de videoanálisis', etiqueta + ' · ' + mmss(inicio) + '–' + mmss(fin));
+    toast.success('Evento registrado (' + mmss(inicio) + ' – ' + mmss(fin) + ')');
+    setPickerOpen(false);
+    resetSeleccion();
+  }
+
+  function onSelectJugador(jugadorId) {
+    if (!pendingPoint) { setPickerOpen(false); return; }
+    finalizarEvento(pendingPoint, jugadorId);
+  }
+
+  function seekTo(seg) {
+    if (playerRef.current && playerRef.current.seekTo) {
+      playerRef.current.seekTo(seg, true);
+      playerRef.current.playVideo();
+    }
+  }
+
+  function ajustarCorte(id, campo, delta) {
+    let actualizado = null;
+    setEventos(cur => cur.map(e => {
+      if (e.id !== id) return e;
+      actualizado = campo === 'inicio' ? { ...e, inicio: clamp(e.inicio + delta, 0, e.fin - 1) } : { ...e, fin: Math.max(e.inicio + 1, e.fin + delta) };
+      return actualizado;
+    }));
+    if (actualizado) {
+      const inicio = actualizado.inicio, fin = actualizado.fin;
+      syncClipVinculado(clips => clips.map(c => c.id === id ? { ...c, inicio, fin } : c));
+    }
+  }
+
+  async function eliminarEvento(id) {
+    const ok = await confirm({ title: 'Eliminar evento', message: '¿Eliminar este registro del videoanálisis?', danger: true, confirmLabel: 'Eliminar' });
+    if (!ok) return;
+    setEventos(cur => cur.filter(e => e.id !== id));
+    syncClipVinculado(clips => clips.filter(c => c.id !== id));
+    toast.success('Eliminado');
+  }
+
+  function guardarEdicion(patch) {
+    const actualizado = { ...editingEvento, ...patch };
+    setEventos(cur => cur.map(e => e.id === editingEvento.id ? actualizado : e));
+    syncClipVinculado(clips => clips.map(c => c.id === editingEvento.id ? clipDeEvento(actualizado, players) : c));
+    toast.success('Guardado');
+    setEditingEvento(null);
+  }
+
+  function exportarCsv() {
+    const csv = eventosVideoanalisisToCsv(eventos, players);
+    offerDownload('videoanalisis_' + videoId + '.csv', '﻿' + csv);
+  }
+
+  const esLocal = !!(videoId && videoId.startsWith('local:'));
+  const bloqueoYoutube = bloqueadoPorFileProtocol && !esLocal;
+
+  return (
     <div className="space-y-4">
-      {canEdit && (
-        <div className="flex gap-2 max-w-md">
-          <input className="field-input" placeholder='Ej. "Análisis rival jornada 7"' value={nombre} onChange={e => setNombre(e.target.value)} />
-          <button className="btn btn-primary" onClick={crearPlaylist}><Icon name="plus" size={15} />Crear</button>
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-sm text-muted shrink-0">Ver videoanálisis de la jornada:</span>
+        <select className="field-input w-auto" defaultValue="" onChange={e => { irAJornadaAnalisis(e.target.value); e.target.value = ''; }}>
+          <option value="">Elegir jornada…</option>
+          {JORNADAS_LIGA.map(n => {
+            const partido = SEED_CALENDARIO_2627.find(c => c.jornada === n);
+            const hayVideo = (videos.items || []).some(v => v.categoria === 'liga' && Number(v.jornada) === n);
+            const etiqueta = (partido
+              ? 'Jornada ' + n + ' · ' + (partido.condicion === 'local' ? 'vs ' : '@ ') + partido.rival + ' · ' + fmtFecha(partido.fecha)
+              : 'Jornada ' + n) + (hayVideo ? '' : ' (sin vídeo)');
+            return <option key={n} value={n}>{etiqueta}</option>;
+          })}
+        </select>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="flex gap-1 surface-2 rounded-lg p-1 w-fit">
+          <button type="button" onClick={() => elegirModoFuente('url')} className="px-3 py-1 rounded-md text-sm font-medium" style={{ background: modoFuente === 'url' ? 'var(--club-red)' : 'transparent', color: modoFuente === 'url' ? '#fff' : 'var(--text)' }}>Enlace de YouTube</button>
+          <button type="button" onClick={() => elegirModoFuente('archivo')} className="px-3 py-1 rounded-md text-sm font-medium" style={{ background: modoFuente === 'archivo' ? 'var(--club-red)' : 'transparent', color: modoFuente === 'archivo' ? '#fff' : 'var(--text)' }}>Subir desde el ordenador</button>
+        </div>
+        {modoFuente === 'url' ? (
+          <React.Fragment>
+            <div className="flex-1 min-w-[220px]">
+              <input className="field-input" placeholder="Pega la URL de YouTube del partido…" value={urlInput}
+                onChange={e => handleUrlChange(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') cargarVideo(urlInput); }} />
+            </div>
+            <button className="btn btn-secondary" onClick={() => cargarVideo(urlInput)}><Icon name="play" size={15} />Cargar vídeo</button>
+          </React.Fragment>
+        ) : (
+          <React.Fragment>
+            <button type="button" className="btn btn-secondary" onClick={() => fileInputRef.current.click()}>
+              <Icon name="upload" size={15} />Cargar vídeo
+            </button>
+            {localFileName && <span className="text-sm text-muted truncate">{localFileName}</span>}
+            <input ref={fileInputRef} type="file" accept="video/*" className="hidden" onChange={onElegirArchivoLocal} />
+          </React.Fragment>
+        )}
+        {eventos.length > 0 && <button className="btn btn-secondary" onClick={exportarCsv}><Icon name="download" size={15} />Exportar CSV</button>}
+      </div>
+
+      {videoId && !bloqueoYoutube && (
+        <div className="flex flex-wrap items-center gap-2 text-sm">
+          <span className="text-muted">Vincular cortes con vídeo de Jornadas:</span>
+          <select className="field-input w-auto" value={vinculadoId} onChange={e => vincularVideo(e.target.value)}>
+            <option value="">Sin vincular</option>
+            {itemsVinculables.map(it => (
+              <option key={it.id} value={it.id}>
+                {it.categoria === 'liga' ? 'Jornada ' + it.jornada : 'Pretemporada ' + it.pretemporadaNum}{it.titulo ? ' · ' + it.titulo : ''}
+              </option>
+            ))}
+          </select>
+          {vinculadoId && <span className="text-muted">Los cortes se guardan también como clips en ese vídeo.</span>}
         </div>
       )}
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-        {playlists.map(pl => (
-          <div key={pl.id} className="card p-4">
-            <div className="flex items-center justify-between mb-2">
-              <span className="font-semibold">{pl.nombre}</span>
-              <div className="flex items-center gap-1">
-                <button className="icon-btn" onClick={() => setOpenId(openId === pl.id ? null : pl.id)}><Icon name={openId === pl.id ? 'chevronDown' : 'chevronRight'} size={15} /></button>
-                {canEdit && <button className="icon-btn" onClick={() => eliminarPlaylist(pl.id)}><Icon name="trash" size={15} /></button>}
-              </div>
-            </div>
-            <div className="text-xs text-muted mb-2">{pl.videoIds.length} vídeos</div>
-            {openId === pl.id && (
-              <div className="space-y-1 max-h-56 overflow-y-auto">
-                {(videos.items || []).map(v => (
-                  <label key={v.id} className="flex items-center gap-2 text-sm">
-                    <input type="checkbox" checked={pl.videoIds.includes(v.id)} disabled={!canEdit} onChange={() => toggleVideoInPlaylist(pl.id, v.id)} />
-                    <button onClick={() => onOpenVideo(v)} className="hover:underline text-left flex-1 truncate">{v.titulo}</button>
-                  </label>
-                ))}
-              </div>
-            )}
+
+      {bloqueoYoutube && (
+        <div className="card p-4 flex items-start gap-2" style={{ borderColor: 'var(--warn)', background: 'var(--warn-bg)' }}>
+          <Icon name="alertTriangle" style={{ color: 'var(--warn)' }} className="mt-0.5 shrink-0" />
+          <div className="text-sm">
+            <b>El vídeo de YouTube no se puede reproducir así.</b> Has abierto este archivo directamente (doble clic), y YouTube
+            no permite embeber vídeos desde una página abierta con <code>file://</code>. Ejecuta <code>./start-banquillo.sh</code>
+            (o <code>python3 -m http.server</code> en esta carpeta) y abre <code>http://localhost:8744/sporting-banquillo.html</code>
+            en el navegador. (Los vídeos subidos desde el ordenador no tienen este problema.)
           </div>
-        ))}
-        {!playlists.length && <EmptyState icon="video" text="Crea tu primera lista de reproducción." />}
-      </div>
+        </div>
+      )}
+
+      {!videoId || bloqueoYoutube ? (
+        <EmptyState icon="video" text={bloqueoYoutube ? 'Abre la página desde el servidor local para poder cargar el vídeo de YouTube.' : 'Pega el enlace de un vídeo de YouTube o sube un archivo desde el ordenador para empezar el videoanálisis.'} />
+      ) : (
+        <React.Fragment>
+          <div className="grid grid-cols-1 xl:grid-cols-12 gap-4 items-start">
+            <div className="xl:col-span-5">
+              {esLocal ? (
+                <LocalAnalisisPlayer key={videoId} src={localVideoUrl} playerRef={playerRef} onPlayingChange={setIsPlaying} />
+              ) : (
+                <YoutubeAnalisisPlayer key={videoId} videoId={videoId} playerRef={playerRef} onPlayingChange={setIsPlaying} />
+              )}
+            </div>
+            <div className="xl:col-span-3">
+              {canEdit ? (
+                <BotoneraRegistro parte={parte} setParte={setParte} tipoJugada={tipoJugada} onTipoJugada={toggleTipoJugada}
+                  signo={signo} onSigno={toggleSigno} abp={abp} onAbp={toggleAbp} individual={individual} onIndividual={toggleIndividual}
+                  crono={currentTime} />
+              ) : (
+                <div className="card p-4 text-sm text-muted">No tienes permisos para registrar eventos en Videoteca.</div>
+              )}
+            </div>
+            <div className="xl:col-span-4">
+              <div className="field-label mb-1">{listoParaCampo ? 'Marca en el campo al jugador o zona implicada' : 'Elige GOL/OCASIÓN + signo, o bien ABP OF/DEF/INDIVIDUAL, para activar el campo'}</div>
+              <AnalisisPitch activo={canEdit && listoParaCampo} onPick={onPitchPick} pendingPoint={pendingPoint}
+                onBlockedClick={() => toast.error(canEdit ? 'Elige GOL/OCASIÓN + A FAVOR/EN CONTRA, o bien ABP OF/DEF/INDIVIDUAL, antes de marcar en el campo.' : 'No tienes permisos para registrar eventos en Videoteca.')} />
+            </div>
+          </div>
+
+          <TablaEventosAnalisis eventos={eventos} players={players} canEdit={canEdit} canDelete={canDelete}
+            onSeek={seekTo} onEdit={setEditingEvento} onDelete={eliminarEvento} onAjustar={ajustarCorte} />
+        </React.Fragment>
+      )}
+
+      {pickerOpen && (
+        <SeleccionarJugadorModal players={players} onSelect={onSelectJugador} onClose={() => { setPickerOpen(false); setPendingPoint(null); }} />
+      )}
+
+      {editingEvento && (
+        <EventoEditModal evento={editingEvento} players={players} onClose={() => setEditingEvento(null)} onSave={guardarEdicion} />
+      )}
     </div>
   );
 }

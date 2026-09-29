@@ -1,3 +1,5 @@
 .DS_Store
 __pycache__/
 *.pyc
+.tmp_player_photos/
+reparar-fotos.html
