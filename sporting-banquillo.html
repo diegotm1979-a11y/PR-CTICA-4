@@ -412,7 +412,7 @@ const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 // esté en `false`, y revertirlo (está al final de ese mismo archivo) cuando
 // se vuelva a poner en `true`.
 // ----------------------------------------------------------------------------
-const REQUIRE_AUTH = false;
+const REQUIRE_AUTH = true;
 const GUEST_USER = { id: null, usuario: 'Invitado local', rol: 'Administrador', activo: true };
 
 // Las fotos ("photo:xxx") y vídeos ("video:xxx") se guardan como objetos en

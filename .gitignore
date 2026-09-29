@@ -4,3 +4,4 @@ __pycache__/
 .tmp_player_photos/
 reparar-fotos.html
 supabase/bypass_auth_TEMP.sql
+.vercel
