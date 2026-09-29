@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 .tmp_player_photos/
 reparar-fotos.html
+supabase/bypass_auth_TEMP.sql
