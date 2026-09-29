@@ -7,6 +7,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.26.10/babel.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.2/html2pdf.bundle.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
 <script src="https://cdn.tailwindcss.com"></script>
 <script>
   tailwind.config = {
@@ -391,131 +392,94 @@ function aplicarFormacion(titulares, sistema) {
 }
 </script>
 <script>
-let __dbApi = null;
-let __downloadsApi = null;
-let __capabilitiesReady = null;
+// ============================================================================
+// Cliente de Supabase: sustituye a localStorage/IndexedDB como backend.
+// ============================================================================
+// Rellena estos dos valores con los de tu proyecto (Supabase > Project Settings
+// > API > "Project URL" y "anon public"). La clave "anon" está pensada para ir
+// en el propio HTML: la protección real la da Row Level Security en la base de
+// datos (ver supabase/schema.sql), no el secreto de esta clave.
+const SUPABASE_URL = 'https://zgfggwqeamdcppwhtdso.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpnZmdnd3FlYW1kY3Bwd2h0ZHNvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTA2NzU5MjksImV4cCI6MjEwNjI1MTkyOX0.jiUZx-KKBBTPEf-RNMg9fqBGYLEuIpT7HeUwMaHCBMA';
+const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-function initCapabilities() {
-  if (__capabilitiesReady) return __capabilitiesReady;
-  __capabilitiesReady = (async () => {
-    try {
-      if (window.claude && window.claude.use) {
-        __dbApi = await window.claude.use('db');
-        __downloadsApi = await window.claude.use('downloads');
-      }
-    } catch (e) { /* sin conexión de plataforma: se seguirá en memoria */ }
-    return { db: __dbApi, downloads: __downloadsApi };
-  })();
-  return __capabilitiesReady;
-}
+// ----------------------------------------------------------------------------
+// BYPASS TEMPORAL DE INICIO DE SESIÓN — pon esto en `true` en cuanto quieras
+// volver a exigir cuenta y contraseña. Con `false`, la app entra directamente
+// como invitado con todos los permisos, sin pasar por Supabase Auth.
+// Para que además funcione con la base de datos (y no falle por RLS), hay que
+// ejecutar también supabase/bypass_auth_TEMP.sql en Supabase mientras esto
+// esté en `false`, y revertirlo (está al final de ese mismo archivo) cuando
+// se vuelva a poner en `true`.
+// ----------------------------------------------------------------------------
+const REQUIRE_AUTH = false;
+const GUEST_USER = { id: null, usuario: 'Invitado local', rol: 'Administrador', activo: true };
 
-const LOCAL_STORAGE_PREFIX = 'sportingBanquillo:store:';
-
-// Las fotos y vídeos ("photo:"/"video:") pueden pesar mucho más que la cuota
-// de localStorage (unos pocos MB). Se guardan en IndexedDB, que admite
-// archivos grandes, en vez de localStorage (que sólo vale para JSON pequeño).
-const BINARY_ASSET_DB = 'sportingBanquilloAssets';
-const BINARY_ASSET_STORE = 'assets';
-
+// Las fotos ("photo:xxx") y vídeos ("video:xxx") se guardan como objetos en
+// Supabase Storage en vez de como dataURL en IndexedDB: "photo:" va al bucket
+// 'imagenes' (público) y "video:" al bucket 'videos' (privado, con URL firmada).
 function isBinaryAssetKey(key) {
   return key.startsWith('photo:') || key.startsWith('video:');
 }
-
-let __assetDbPromise = null;
-function openAssetDb() {
-  if (!__assetDbPromise) {
-    __assetDbPromise = new Promise((resolve, reject) => {
-      const req = indexedDB.open(BINARY_ASSET_DB, 1);
-      req.onupgradeneeded = () => { req.result.createObjectStore(BINARY_ASSET_STORE); };
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
-    });
-  }
-  return __assetDbPromise;
+function assetLocation(key) {
+  const separador = key.indexOf(':');
+  const prefijo = key.slice(0, separador);
+  const path = key.slice(separador + 1);
+  return { bucket: prefijo === 'photo' ? 'imagenes' : 'videos', path };
 }
-async function idbGet(key) {
-  const db = await openAssetDb();
-  return new Promise((resolve, reject) => {
-    const req = db.transaction(BINARY_ASSET_STORE, 'readonly').objectStore(BINARY_ASSET_STORE).get(key);
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-async function idbSet(key, value) {
-  const db = await openAssetDb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(BINARY_ASSET_STORE, 'readwrite');
-    tx.objectStore(BINARY_ASSET_STORE).put(value, key);
-    tx.oncomplete = () => resolve(true);
-    tx.onerror = () => reject(tx.error);
-  });
-}
-async function idbDelete(key) {
-  const db = await openAssetDb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(BINARY_ASSET_STORE, 'readwrite');
-    tx.objectStore(BINARY_ASSET_STORE).delete(key);
-    tx.oncomplete = () => resolve(true);
-    tx.onerror = () => reject(tx.error);
-  });
+async function dataUrlToBlob(dataUrl) {
+  const res = await fetch(dataUrl);
+  return res.blob();
 }
 
 async function storageGet(key) {
-  await initCapabilities();
-  if (!__dbApi) {
-    if (isBinaryAssetKey(key)) {
-      const fromIdb = await idbGet(key).catch(() => undefined);
-      if (fromIdb !== undefined) return fromIdb;
+  if (isBinaryAssetKey(key)) {
+    const { bucket, path } = assetLocation(key);
+    if (bucket === 'imagenes') {
+      const { data } = sb.storage.from(bucket).getPublicUrl(path);
+      return data.publicUrl;
     }
-    const raw = localStorage.getItem(LOCAL_STORAGE_PREFIX + key);
-    if (raw === null) throw new Error('not_found:' + key);
-    return JSON.parse(raw);
+    // Bucket privado: hace falta una URL firmada (caduca; se pide una nueva cada vez que se abre).
+    const { data, error } = await sb.storage.from(bucket).createSignedUrl(path, 60 * 60 * 24);
+    if (error) throw new Error('not_found:' + key);
+    return data.signedUrl;
   }
-  const snap = await __dbApi.doc('store/' + key).get();
-  if (!snap.exists) throw new Error('not_found:' + key);
-  const raw = snap.data().value;
-  return JSON.parse(raw);
+  const { data, error } = await sb.from('kv_store').select('value').eq('key', key).maybeSingle();
+  if (error) throw error;
+  if (!data) throw new Error('not_found:' + key);
+  return data.value;
 }
 
 async function storageSet(key, value) {
-  await initCapabilities();
-  if (!__dbApi) {
-    if (isBinaryAssetKey(key)) {
-      await idbSet(key, value);
-      return true;
-    }
-    localStorage.setItem(LOCAL_STORAGE_PREFIX + key, JSON.stringify(value));
+  if (isBinaryAssetKey(key)) {
+    const { bucket, path } = assetLocation(key);
+    const blob = (typeof value === 'string' && value.startsWith('data:')) ? await dataUrlToBlob(value) : value;
+    const { error } = await sb.storage.from(bucket).upload(path, blob, { upsert: true, contentType: blob.type || undefined });
+    if (error) throw error;
     return true;
   }
-  await __dbApi.doc('store/' + key).set({ value: JSON.stringify(value), updatedAt: Date.now() });
+  // Las filas de kv_store se crean por SQL al desplegar el esquema (ver
+  // supabase/schema.sql, sección 15); aquí solo se actualizan, nunca se crean.
+  const { error } = await sb.from('kv_store').update({ value }).eq('key', key);
+  if (error) throw error;
   return true;
 }
 
 async function storageDelete(key) {
-  await initCapabilities();
-  if (!__dbApi) {
-    if (isBinaryAssetKey(key)) {
-      await idbDelete(key).catch(() => {});
-    }
-    localStorage.removeItem(LOCAL_STORAGE_PREFIX + key);
+  if (isBinaryAssetKey(key)) {
+    const { bucket, path } = assetLocation(key);
+    await sb.storage.from(bucket).remove([path]).catch(() => {});
     return true;
   }
-  await __dbApi.doc('store/' + key).delete();
+  // Las claves de kv_store son filas fijas (una por módulo): "borrar" una no
+  // tiene sentido en este modelo, así que no hay nada que hacer aquí.
   return true;
 }
 
 async function storageList() {
-  await initCapabilities();
-  if (!__dbApi) {
-    const keys = [];
-    for (let i = 0; i < localStorage.length; i++) {
-      const k = localStorage.key(i);
-      if (k && k.startsWith(LOCAL_STORAGE_PREFIX)) keys.push(k.slice(LOCAL_STORAGE_PREFIX.length));
-    }
-    return keys;
-  }
-  const snap = await __dbApi.collection('store').get();
-  return snap.docs.map(d => d.id);
+  const { data, error } = await sb.from('kv_store').select('key');
+  if (error) throw error;
+  return (data || []).map(r => r.key);
 }
 
 async function loadKey(key, seed) {
@@ -524,6 +488,63 @@ async function loadKey(key, seed) {
   } catch (e) {
     await storageSet(key, seed).catch(() => {});
     return seed;
+  }
+}
+
+// ============================================================================
+// Autenticación (Supabase Auth) y ajustes (role_permissions / club_settings).
+// ============================================================================
+// Supabase Auth pide un email; la app solo maneja "usuario", así que se
+// sintetiza un email interno a partir del usuario. Nunca se envía correo a esa
+// dirección: es solo el identificador que usa Supabase Auth por dentro. Por
+// eso hace falta desactivar "Confirm email" en Authentication > Providers >
+// Email del proyecto de Supabase (si no, la cuenta se queda sin confirmar y no
+// puede iniciar sesión).
+const AUTH_EMAIL_DOMAIN = 'sporting-banquillo.local';
+function usuarioToEmail(usuario) {
+  const limpio = usuario.trim().toLowerCase().replace(/[^a-z0-9_.-]/g, '');
+  return (limpio || 'usuario') + '@' + AUTH_EMAIL_DOMAIN;
+}
+
+async function fetchProfile(userId) {
+  const { data, error } = await sb.from('profiles').select('id, usuario, rol, activo').eq('id', userId).maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+async function loadPermissions() {
+  const { data, error } = await sb.from('role_permissions').select('rol, modulo, nivel');
+  if (error) throw error;
+  const permissions = defaultPermissions();
+  (data || []).forEach(r => { permissions[r.rol] = { ...permissions[r.rol], [r.modulo]: r.nivel }; });
+  return permissions;
+}
+
+async function loadClubInfo() {
+  const { data, error } = await sb.from('club_settings').select('nombre, temporada').eq('id', 1).maybeSingle();
+  if (error) throw error;
+  return data || { nombre: 'Real Sporting de Gijón', temporada: '2026-27' };
+}
+
+async function loadSettings() {
+  const [permissions, clubInfo] = await Promise.all([loadPermissions(), loadClubInfo()]);
+  return { permissions, clubInfo };
+}
+
+async function persistSettings(settings) {
+  const filas = [];
+  Object.entries(settings.permissions || {}).forEach(([rol, modulos]) => {
+    Object.entries(modulos || {}).forEach(([modulo, nivel]) => filas.push({ rol, modulo, nivel }));
+  });
+  if (filas.length) {
+    const { error } = await sb.from('role_permissions').upsert(filas, { onConflict: 'rol,modulo' });
+    if (error) throw error;
+  }
+  if (settings.clubInfo) {
+    const { error } = await sb.from('club_settings')
+      .update({ nombre: settings.clubInfo.nombre, temporada: settings.clubInfo.temporada })
+      .eq('id', 1);
+    if (error) throw error;
   }
 }
 
@@ -558,8 +579,6 @@ async function repairMojibake(key, value) {
 }
 
 async function offerDownload(filename, data) {
-  await initCapabilities();
-  if (__downloadsApi) return __downloadsApi.save({ filename, data });
   const blob = new Blob([data], { type: 'text/plain' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -989,7 +1008,6 @@ function seedMatch(teams, players) {
 </script>
 <script>
 const SEED_VIDEOS = { items: [] };
-const SEED_USERS = [];
 const SEED_SETTINGS = { permissions: defaultPermissions(), clubInfo: { nombre: 'Real Sporting de Gijón', temporada: '2026-27' } };
 const SEED_ACTIVITY = [];
 
@@ -1303,7 +1321,7 @@ function EntityFormModal({ title, fields, initial, onSubmit, onClose, extraValid
 <script type="text/babel" data-presets="react">
 const AppDataCtx = createContext(null);
 
-function useDebouncedPersist(key, value, loading) {
+function useDebouncedPersist(key, value, loading, persistFn) {
   const first = useRef(true);
   const timer = useRef(null);
   useEffect(() => {
@@ -1311,7 +1329,7 @@ function useDebouncedPersist(key, value, loading) {
     if (first.current) { first.current = false; return; }
     if (timer.current) clearTimeout(timer.current);
     timer.current = setTimeout(() => {
-      storageSet(key, value).catch(() => {});
+      (persistFn ? persistFn(value) : storageSet(key, value)).catch(() => {});
     }, 800);
     return () => clearTimeout(timer.current);
   }, [value, loading]);
@@ -1330,43 +1348,92 @@ function AppDataProvider({ children }) {
   const [activity, setActivity] = useState([]);
   const [currentUser, setCurrentUser] = useState(null);
 
+  function appendActivity(usuarioNombre, accion, detalle) {
+    setActivity(list => {
+      const entry = { ts: Date.now(), usuario: usuarioNombre || 'sistema', accion, detalle: detalle || '' };
+      return [entry, ...list].slice(0, 200);
+    });
+  }
+
+  async function refreshUsers() {
+    const { data, error } = await sb.from('profiles').select('id, usuario, rol, activo').order('usuario');
+    if (!error) setUsers(data || []);
+  }
+
+  // Carga plantilla/equipos/partidos/vídeos/actividad/permisos: solo puede
+  // funcionar con una sesión activa, porque cada tabla está protegida con RLS
+  // según el rol del perfil (ver supabase/schema.sql).
+  async function loadAllData() {
+    setLoading(true);
+    try {
+      const seedMatches = () => SEED_TEAMS.length ? seedMatch(SEED_TEAMS, SEED_PLAYERS) : [];
+      let [pl, st, tm, se, ac] = await Promise.all([
+        loadKey('players', SEED_PLAYERS),
+        loadKey('staff', SEED_STAFF),
+        loadKey('teams', SEED_TEAMS),
+        loadSettings(),
+        loadKey('activity', SEED_ACTIVITY),
+      ]);
+      let vd;
+      try { vd = await storageGet('videos'); } catch (e) { vd = SEED_VIDEOS; }
+      let mt;
+      try { mt = await storageGet('matches'); } catch (e) { mt = seedMatches(); }
+      pl = await repairMojibake('players', pl);
+      st = await repairMojibake('staff', st);
+      tm = await repairMojibake('teams', tm);
+      ac = await repairMojibake('activity', ac);
+      mt = await repairMojibake('matches', mt);
+      setPlayers(pl); setStaff(st); setTeams(tm); setSettings(se); setActivity(ac); setVideos(vd); setMatches(mt);
+      await refreshUsers();
+      setLoadError(null);
+    } catch (e) {
+      setLoadError(e && e.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function clearAllData() {
+    setPlayers([]); setStaff([]); setTeams([]); setMatches([]); setVideos(SEED_VIDEOS);
+    setUsers([]); setSettings(SEED_SETTINGS); setActivity([]);
+  }
+
+  // onAuthStateChange dispara un evento inicial ('INITIAL_SESSION') con la
+  // sesión ya guardada en el navegador, así que con este único listener basta
+  // para arrancar, iniciar sesión, cerrar sesión y sobrevivir a recargas.
+  // Se ignoran a propósito TOKEN_REFRESHED/USER_UPDATED (ocurren solos de vez
+  // en cuando) para no recargar toda la app de golpe mientras alguien trabaja.
   useEffect(() => {
-    (async () => {
-      try {
-        await initCapabilities();
-        const seedMatches = () => SEED_TEAMS.length ? seedMatch(SEED_TEAMS, SEED_PLAYERS) : [];
-        let [pl, st, tm, us, se, ac] = await Promise.all([
-          loadKey('players', SEED_PLAYERS),
-          loadKey('staff', SEED_STAFF),
-          loadKey('teams', SEED_TEAMS),
-          loadKey('users', SEED_USERS),
-          loadKey('settings', SEED_SETTINGS),
-          loadKey('activity', SEED_ACTIVITY),
-        ]);
-        let vd;
-        try { vd = await storageGet('videos'); } catch (e) { vd = SEED_VIDEOS; await storageSet('videos', vd).catch(() => {}); }
-        let mt;
-        try { mt = await storageGet('matches'); } catch (e) { mt = seedMatches(); await storageSet('matches', mt).catch(() => {}); }
-        pl = await repairMojibake('players', pl);
-        st = await repairMojibake('staff', st);
-        tm = await repairMojibake('teams', tm);
-        us = await repairMojibake('users', us);
-        ac = await repairMojibake('activity', ac);
-        mt = await repairMojibake('matches', mt);
-        setPlayers(pl); setStaff(st); setTeams(tm); setUsers(us); setSettings(se); setActivity(ac); setVideos(vd); setMatches(mt);
-        try {
-          const lastId = localStorage.getItem('sporting_last_user');
-          if (lastId) {
-            const u = us.find(x => x.id === lastId && x.activo !== false);
-            if (u) setCurrentUser(u);
-          }
-        } catch (e) {}
-      } catch (e) {
-        setLoadError(e && e.message);
-      } finally {
+    // BYPASS TEMPORAL (ver REQUIRE_AUTH arriba del todo del archivo): entra
+    // directo como invitado con todos los permisos, sin pasar por la pantalla
+    // de acceso ni por Supabase Auth. Sigue haciendo falta relajar las
+    // políticas RLS en Supabase (ver supabase/bypass_auth_TEMP.sql) para que
+    // las lecturas/escrituras sin sesión no las rechace la base de datos.
+    if (!REQUIRE_AUTH) {
+      setCurrentUser(GUEST_USER);
+      loadAllData();
+      return;
+    }
+    const { data: sub } = sb.auth.onAuthStateChange(async (event, session) => {
+      if (event === 'SIGNED_OUT') {
+        setCurrentUser(null);
+        clearAllData();
         setLoading(false);
+        return;
       }
-    })();
+      if (!session) { setLoading(false); return; }
+      if (event !== 'SIGNED_IN' && event !== 'INITIAL_SESSION') return;
+      const perfil = await fetchProfile(session.user.id).catch(() => null);
+      if (!perfil || perfil.activo === false) {
+        setCurrentUser(null);
+        setLoading(false);
+        return;
+      }
+      setCurrentUser(perfil);
+      await loadAllData();
+      if (event === 'SIGNED_IN') appendActivity(perfil.usuario, 'Inicio de sesión', '');
+    });
+    return () => sub.subscription.unsubscribe();
   }, []);
 
   useDebouncedPersist('players', players, loading);
@@ -1374,25 +1441,20 @@ function AppDataProvider({ children }) {
   useDebouncedPersist('teams', teams, loading);
   useDebouncedPersist('matches', matches, loading);
   useDebouncedPersist('videos', videos, loading);
-  useDebouncedPersist('users', users, loading);
-  useDebouncedPersist('settings', settings, loading);
+  useDebouncedPersist('settings', settings, loading, persistSettings);
   useDebouncedPersist('activity', activity, loading);
 
   function pushActivity(accion, detalle) {
-    setActivity(list => {
-      const entry = { ts: Date.now(), usuario: currentUser ? currentUser.usuario : 'sistema', accion, detalle: detalle || '' };
-      return [entry, ...list].slice(0, 200);
-    });
+    appendActivity(currentUser ? currentUser.usuario : 'sistema', accion, detalle);
   }
 
-  function login(user) {
-    setCurrentUser(user);
-    try { localStorage.setItem('sporting_last_user', user.id); } catch (e) {}
-  }
-  function logout() {
-    pushActivity('Cierre de sesión', currentUser ? currentUser.usuario : '');
-    setCurrentUser(null);
-    try { localStorage.removeItem('sporting_last_user'); } catch (e) {}
+  async function logout() {
+    if (!REQUIRE_AUTH) return; // bypass temporal: no hay sesión real que cerrar
+    if (currentUser) {
+      const entry = { ts: Date.now(), usuario: currentUser.usuario, accion: 'Cierre de sesión', detalle: '' };
+      await storageSet('activity', [entry, ...activity].slice(0, 200)).catch(() => {});
+    }
+    await sb.auth.signOut();
   }
 
   function canDo(modulo, nivel) { return can(currentUser, settings, modulo, nivel); }
@@ -1400,8 +1462,8 @@ function AppDataProvider({ children }) {
   const value = {
     loading, loadError,
     players, setPlayers, staff, setStaff, teams, setTeams, matches, setMatches,
-    videos, setVideos, users, setUsers, settings, setSettings, activity, pushActivity,
-    currentUser, login, logout, canDo,
+    videos, setVideos, users, refreshUsers, settings, setSettings, activity, pushActivity,
+    currentUser, logout, canDo,
   };
   return <AppDataCtx.Provider value={value}>{children}</AppDataCtx.Provider>;
 }
@@ -1409,40 +1471,39 @@ function useAppData() { return useContext(AppDataCtx); }
 </script>
 <script type="text/babel" data-presets="react">
 function AuthScreen() {
-  const { users, setUsers, login, pushActivity } = useAppData();
   const toast = useToast();
-  const isFirstRun = users.length === 0;
+  const [modo, setModo] = useState('login'); // 'login' | 'signup'
   const [usuario, setUsuario] = useState('');
   const [password, setPassword] = useState('');
   const [password2, setPassword2] = useState('');
   const [busy, setBusy] = useState(false);
 
-  async function handleCreateAdmin(e) {
-    e.preventDefault();
-    if (!usuario.trim() || !password) { toast.error('Rellena usuario y contraseña'); return; }
-    if (password.length < 4) { toast.error('La contraseña debe tener al menos 4 caracteres'); return; }
-    if (password !== password2) { toast.error('Las contraseñas no coinciden'); return; }
-    setBusy(true);
-    try {
-      const passwordHash = await sha256(password);
-      const admin = { id: uid('u'), usuario: usuario.trim(), passwordHash, rol: 'Administrador', activo: true };
-      setUsers([admin]);
-      login(admin);
-      toast.success('Administrador creado. ¡Bienvenido!');
-    } finally { setBusy(false); }
-  }
-
+  // onAuthStateChange (en AppDataProvider) recoge el inicio de sesión solo en
+  // cuanto Supabase confirma la sesión; aquí no hace falta tocar currentUser.
   async function handleLogin(e) {
     e.preventDefault();
     if (!usuario.trim() || !password) { toast.error('Introduce usuario y contraseña'); return; }
     setBusy(true);
     try {
-      const passwordHash = await sha256(password);
-      const user = users.find(u => u.usuario.toLowerCase() === usuario.trim().toLowerCase() && u.passwordHash === passwordHash);
-      if (!user) { toast.error('Usuario o contraseña incorrectos'); return; }
-      if (user.activo === false) { toast.error('Este usuario está desactivado'); return; }
-      login(user);
-      pushActivity('Inicio de sesión', user.usuario);
+      const { error } = await sb.auth.signInWithPassword({ email: usuarioToEmail(usuario), password });
+      if (error) toast.error('Usuario o contraseña incorrectos');
+    } finally { setBusy(false); }
+  }
+
+  async function handleSignup(e) {
+    e.preventDefault();
+    if (!usuario.trim() || !password) { toast.error('Rellena usuario y contraseña'); return; }
+    if (password.length < 6) { toast.error('La contraseña debe tener al menos 6 caracteres'); return; }
+    if (password !== password2) { toast.error('Las contraseñas no coinciden'); return; }
+    setBusy(true);
+    try {
+      const { error } = await sb.auth.signUp({
+        email: usuarioToEmail(usuario),
+        password,
+        options: { data: { usuario: usuario.trim() } },
+      });
+      if (error) { toast.error(error.message || 'No se pudo crear la cuenta'); return; }
+      toast.success('Cuenta creada. La primera cuenta del club es Administrador; las siguientes empiezan como Invitado hasta que un Administrador les asigne un rol.');
     } finally { setBusy(false); }
   }
 
@@ -1456,23 +1517,24 @@ function AuthScreen() {
           <h1 className="font-display text-2xl font-bold text-center leading-tight">Real Sporting de Gijón</h1>
           <p className="text-sm text-muted">Gestión deportiva · Temporada 2026-27</p>
         </div>
-        {isFirstRun ? (
-          <form onSubmit={handleCreateAdmin} className="space-y-3">
-            <p className="text-sm text-muted mb-1">Primer arranque: crea la cuenta de Administrador.</p>
-            <FieldInput field={{ name: 'usuario', label: 'Usuario', required: true }} value={usuario} onChange={setUsuario} />
-            <FieldInput field={{ name: 'password', label: 'Contraseña', type: 'password', required: true }} value={password} onChange={setPassword} />
-            <FieldInput field={{ name: 'password2', label: 'Repite la contraseña', type: 'password', required: true }} value={password2} onChange={setPassword2} />
-            <button className="btn btn-primary w-full mt-2" disabled={busy}>
-              <Icon name="shield" size={15} />Crear administrador
-            </button>
-          </form>
-        ) : (
+        {modo === 'login' ? (
           <form onSubmit={handleLogin} className="space-y-3">
             <FieldInput field={{ name: 'usuario', label: 'Usuario', required: true }} value={usuario} onChange={setUsuario} />
             <FieldInput field={{ name: 'password', label: 'Contraseña', type: 'password', required: true }} value={password} onChange={setPassword} />
             <button className="btn btn-primary w-full mt-2" disabled={busy}>
               <Icon name="logIn" size={15} />Entrar
             </button>
+            <button type="button" className="btn btn-ghost w-full text-sm" onClick={() => setModo('signup')}>¿No tienes cuenta? Regístrate</button>
+          </form>
+        ) : (
+          <form onSubmit={handleSignup} className="space-y-3">
+            <FieldInput field={{ name: 'usuario', label: 'Usuario', required: true }} value={usuario} onChange={setUsuario} />
+            <FieldInput field={{ name: 'password', label: 'Contraseña', type: 'password', required: true }} value={password} onChange={setPassword} />
+            <FieldInput field={{ name: 'password2', label: 'Repite la contraseña', type: 'password', required: true }} value={password2} onChange={setPassword2} />
+            <button className="btn btn-primary w-full mt-2" disabled={busy}>
+              <Icon name="shield" size={15} />Crear cuenta
+            </button>
+            <button type="button" className="btn btn-ghost w-full text-sm" onClick={() => setModo('login')}>¿Ya tienes cuenta? Inicia sesión</button>
           </form>
         )}
       </div>
@@ -4276,7 +4338,7 @@ function VideoAnalisisScreen() {
 </script>
 <script type="text/babel" data-presets="react">
 function UsuariosScreen() {
-  const { users, setUsers, settings, setSettings, activity, currentUser, canDo, pushActivity } = useAppData();
+  const { users, refreshUsers, settings, setSettings, activity, currentUser, canDo, pushActivity } = useAppData();
   const toast = useToast();
   const confirm = useConfirm();
   const [editing, setEditing] = useState(undefined);
@@ -4286,44 +4348,43 @@ function UsuariosScreen() {
   const canDelete = canDo('usuarios', 'eliminar');
   const isAdmin = currentUser.rol === 'Administrador';
 
-  function userFormFields(isNew) {
-    const f = [
+  // Las cuentas se dan de alta ellas mismas desde la pantalla de acceso
+  // (Supabase Auth necesita una contraseña que solo la propia persona debe
+  // conocer); aquí un Administrador/Entrenador solo asigna usuario y rol.
+  function userFormFields() {
+    return [
       { name: 'usuario', label: 'Usuario', required: true },
       { name: 'rol', label: 'Rol', type: 'select', required: true, options: ROLES.map(r => ({ value: r, label: r })) },
-      { name: 'password', label: isNew ? 'Contraseña' : 'Nueva contraseña (opcional)', type: 'password', required: isNew },
     ];
-    return f;
   }
 
   async function saveUser(values) {
     const usuarioLower = values.usuario.trim().toLowerCase();
-    const dup = users.some(u => u.usuario.toLowerCase() === usuarioLower && u.id !== (editing && editing.id));
+    const dup = users.some(u => u.usuario.toLowerCase() === usuarioLower && u.id !== editing.id);
     if (dup) { toast.error('Ya existe un usuario con ese nombre'); return; }
-    if (editing && editing.id) {
-      let passwordHash = editing.passwordHash;
-      if (values.password) passwordHash = await sha256(values.password);
-      setUsers(list => list.map(u => u.id === editing.id ? { ...u, usuario: values.usuario, rol: values.rol, passwordHash } : u));
-      pushActivity('Editó usuario', values.usuario);
-    } else {
-      const passwordHash = await sha256(values.password);
-      setUsers(list => [...list, { id: uid('u'), usuario: values.usuario, rol: values.rol, passwordHash, activo: true }]);
-      pushActivity('Creó usuario', values.usuario);
-    }
+    const { error } = await sb.from('profiles').update({ usuario: values.usuario.trim(), rol: values.rol }).eq('id', editing.id);
+    if (error) { toast.error('No se pudo guardar: ' + error.message); return; }
+    await refreshUsers();
+    pushActivity('Editó usuario', values.usuario);
     toast.success('Guardado');
     setEditing(undefined);
   }
 
-  function toggleActivo(u) {
+  async function toggleActivo(u) {
     if (u.id === currentUser.id) { toast.error('No puedes desactivar tu propia cuenta'); return; }
-    setUsers(list => list.map(x => x.id === u.id ? { ...x, activo: x.activo === false } : x));
+    const { error } = await sb.from('profiles').update({ activo: u.activo === false }).eq('id', u.id);
+    if (error) { toast.error('No se pudo cambiar: ' + error.message); return; }
+    await refreshUsers();
     pushActivity(u.activo === false ? 'Activó usuario' : 'Desactivó usuario', u.usuario);
   }
 
   async function removeUser(u) {
     if (u.id === currentUser.id) { toast.error('No puedes eliminar tu propia cuenta'); return; }
-    const ok = await confirm({ title: 'Eliminar usuario', message: '¿Eliminar a ' + u.usuario + '?', danger: true, confirmLabel: 'Eliminar' });
+    const ok = await confirm({ title: 'Eliminar usuario', message: '¿Eliminar a ' + u.usuario + '? Perderá el acceso a la aplicación (su cuenta de acceso no se borra, solo el perfil).', danger: true, confirmLabel: 'Eliminar' });
     if (!ok) return;
-    setUsers(list => list.filter(x => x.id !== u.id));
+    const { error } = await sb.from('profiles').delete().eq('id', u.id);
+    if (error) { toast.error('No se pudo eliminar: ' + error.message); return; }
+    await refreshUsers();
     pushActivity('Eliminó usuario', u.usuario);
   }
 
@@ -4335,8 +4396,8 @@ function UsuariosScreen() {
     <div className="p-4 md:p-6 max-w-5xl mx-auto space-y-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <h1 className="font-display text-2xl font-bold">Usuarios</h1>
-        {canEdit && tabView === 'usuarios' && <button className="btn btn-primary" onClick={() => setEditing(null)}><Icon name="plus" size={16} />Añadir usuario</button>}
       </div>
+      {tabView === 'usuarios' && <p className="text-sm text-muted -mt-3">Cada persona se da de alta desde la pantalla de acceso; aquí puedes asignarle el rol, activarla o desactivarla.</p>}
       <div className="flex gap-1 surface-2 rounded-lg p-1 w-fit scrollx max-w-full">
         <button onClick={() => setTabView('usuarios')} className="px-3 py-1.5 rounded-lg text-sm font-medium whitespace-nowrap" style={{ background: tabView === 'usuarios' ? 'var(--club-red)' : 'transparent', color: tabView === 'usuarios' ? '#fff' : 'var(--text)' }}>Usuarios</button>
         {isAdmin && <button onClick={() => setTabView('permisos')} className="px-3 py-1.5 rounded-lg text-sm font-medium whitespace-nowrap" style={{ background: tabView === 'permisos' ? 'var(--club-red)' : 'transparent', color: tabView === 'permisos' ? '#fff' : 'var(--text)' }}>Permisos</button>}
@@ -4404,9 +4465,9 @@ function UsuariosScreen() {
         </div>
       )}
 
-      {editing !== undefined && (
-        <EntityFormModal title={editing ? 'Editar usuario' : 'Nuevo usuario'} fields={userFormFields(!editing)}
-          initial={editing ? { usuario: editing.usuario, rol: editing.rol } : { rol: 'Entrenador' }}
+      {editing != null && (
+        <EntityFormModal title="Editar usuario" fields={userFormFields()}
+          initial={{ usuario: editing.usuario, rol: editing.rol }}
           onSubmit={saveUser} onClose={() => setEditing(undefined)} />
       )}
     </div>
